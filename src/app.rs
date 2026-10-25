@@ -255,7 +255,7 @@ impl eframe::App for ObsidianRecorderApp {
             ui.separator();
 
             ui.label("Microphone");
-            egui::ComboBox::from_id_salt("device-select")
+            egui::ComboBox::from_id_source("device-select")
                 .selected_text(
                     self.selected_device
                         .clone()
