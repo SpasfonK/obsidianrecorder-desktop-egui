@@ -1,10 +1,10 @@
-# ObsidianRECORDER Desktop — Mini-overlay vu-mètre (RMS live)
+# ObsidianRECORDER Desktop
 
-Dernier morceau du cahier des charges original : l'**overlay flottant avec
-vu-mètre audio en temps réel** pendant l'enregistrement. Toutes les
-itérations précédentes (socle audio, raccourci global, STT Whisper, export
-Obsidian, réglages, System Tray, dashboard + lecture) restent inchangées —
-voir les README précédents pour leur détail.
+Distribution **portable** (le modèle Whisper vit à côté de l'exécutable) et
+**interface retravaillée** (sobre, un seul accent, cartes arrondies). Le
+reste — socle audio, raccourci global, STT Whisper hors ligne, export
+Obsidian, réglages, System Tray, dashboard + lecture, mini-overlay vu-mètre —
+reste inchangé (voir les sections précédentes pour leur détail).
 
 ## 1. Ce qui est livré
 
@@ -21,8 +21,8 @@ voir les README précédents pour leur détail.
   lu par `AudioCapture::level()`.
 - `app.rs` lit ce niveau à chaque frame et affiche une petite fenêtre
   secondaire (`ctx.show_viewport_immediate`, le mécanisme multi-fenêtres
-  natif d'egui) tant que l'enregistrement est actif : barre de progression
-  simple, toujours au premier plan, sans bordure.
+  natif d'egui) tant que l'enregistrement est actif : vu-mètre fin dessiné au
+  peintre (piste + remplissage accent), toujours au premier plan, sans bordure.
 - Cette fenêtre n'a besoin d'aucune gestion d'état manuelle : une
   « immediate viewport » egui ne reste affichée que tant qu'on continue à
   l'appeler à chaque frame. Dès que l'enregistrement s'arrête, on cesse de
@@ -77,3 +77,27 @@ cargo test --all
 
 Aucune nouvelle dépendance Cargo (le multi-viewport fait partie d'`egui`,
 déjà présent).
+
+## 7. Distribution portable et identité visuelle
+
+- **Modèle Whisper à côté de l'exécutable** : le dossier des modèles
+  (`stt::model::models_dir`) n'est plus `%LOCALAPPDATA%\ObsidianRECORDER\models`
+  mais le **dossier de l'exécutable lui-même** (`paths::portable_dir`,
+  `std::env::current_exe`). Le `.exe` et son `ggml-*.bin` forment ainsi un
+  dossier auto-suffisant, déplaçable tel quel, sans rien écrire dans le
+  profil utilisateur. Par compatibilité, un modèle déjà présent dans
+  l'ancien dossier `%LOCALAPPDATA%\ObsidianRECORDER\models` reste reconnu en
+  repli (aucun re-téléchargement de plusieurs centaines de Mo imposé).
+  `scripts/download-model.ps1` place désormais le modèle
+  à côté du script (cas de l'archive portable, où `.exe` et script sont
+  extraits côte à côte), sinon dans `target\release` puis `target\debug`, et
+  enfin dans le dossier courant — un paramètre `-DestinationDir` permet de
+  cibler un dossier de distribution précis. L'artefact CI inclut le script,
+  pour que le dossier extrait reste auto-suffisant.
+- **Interface retravaillée** (« sobre mais stylé ») : `app.rs` applique un
+  style egui personnalisé (`apply_style`) — palette gris-bleu désaturée avec
+  un unique accent indigo, cartes arrondies à filet discret, titres de
+  section en petites capitales, bouton d'enregistrement pleine largeur,
+  vu-mètre fin dessiné au peintre, et typographie/spacings cohérents. Le
+  thème clair/sombre/système des réglages pilote l'ensemble, et l'overlay
+  d'enregistrement hérite de la même palette.

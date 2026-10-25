@@ -90,6 +90,12 @@ pub struct ObsidianRecorderApp {
     /// Lecteur audio d'aperçu (dashboard des notes récentes) — propre à
     /// l'interface, aucun autre thread n'y touche.
     playback: AudioPlayback,
+    /// Dernière préférence de thème effectivement appliquée et palette
+    /// correspondante : évite de reconstruire tout le `Style` egui à chaque
+    /// image (voir `update`). `None` tant que le premier style n'a pas été
+    /// posé.
+    applied_theme: Option<ThemePreference>,
+    palette: Palette,
 }
 
 impl ObsidianRecorderApp {
@@ -155,6 +161,8 @@ impl ObsidianRecorderApp {
             show_settings: false,
             tags_input,
             playback: AudioPlayback::new(),
+            applied_theme: None,
+            palette: palette(true),
         }
     }
 
@@ -185,6 +193,180 @@ impl ObsidianRecorderApp {
     }
 }
 
+/// Palette de couleurs sobre et unifiée, dérivée du mode clair/sombre.
+#[derive(Clone, Copy)]
+struct Palette {
+    bg: egui::Color32,
+    card: egui::Color32,
+    card_alt: egui::Color32,
+    border: egui::Color32,
+    text: egui::Color32,
+    muted: egui::Color32,
+    accent: egui::Color32,
+    accent_soft: egui::Color32,
+    danger: egui::Color32,
+    ok: egui::Color32,
+}
+
+/// Construit la palette correspondant au mode sombre ou clair. Teintes
+/// désaturées (gris bleutés) et un seul accent indigo, pour un rendu sobre.
+fn palette(dark: bool) -> Palette {
+    if dark {
+        Palette {
+            bg: egui::Color32::from_rgb(0x10, 0x12, 0x16),
+            card: egui::Color32::from_rgb(0x18, 0x1B, 0x21),
+            card_alt: egui::Color32::from_rgb(0x1F, 0x23, 0x2B),
+            border: egui::Color32::from_rgb(0x26, 0x2B, 0x34),
+            text: egui::Color32::from_rgb(0xE7, 0xE9, 0xEE),
+            muted: egui::Color32::from_rgb(0x8B, 0x93, 0xA1),
+            accent: egui::Color32::from_rgb(0x7C, 0x8C, 0xF8),
+            accent_soft: egui::Color32::from_rgba_unmultiplied(0x7C, 0x8C, 0xF8, 0x26),
+            danger: egui::Color32::from_rgb(0xE5, 0x48, 0x4D),
+            ok: egui::Color32::from_rgb(0x46, 0xA7, 0x58),
+        }
+    } else {
+        Palette {
+            bg: egui::Color32::from_rgb(0xF4, 0xF5, 0xF7),
+            card: egui::Color32::from_rgb(0xFF, 0xFF, 0xFF),
+            card_alt: egui::Color32::from_rgb(0xF0, 0xF1, 0xF4),
+            border: egui::Color32::from_rgb(0xE2, 0xE4, 0xE9),
+            text: egui::Color32::from_rgb(0x1A, 0x1C, 0x21),
+            muted: egui::Color32::from_rgb(0x6A, 0x72, 0x80),
+            accent: egui::Color32::from_rgb(0x4F, 0x63, 0xE6),
+            accent_soft: egui::Color32::from_rgba_unmultiplied(0x4F, 0x63, 0xE6, 0x1F),
+            danger: egui::Color32::from_rgb(0xDC, 0x2B, 0x31),
+            ok: egui::Color32::from_rgb(0x2F, 0x9E, 0x44),
+        }
+    }
+}
+
+/// Applique le style personnalisé (couleurs, arrondis, typographie) au
+/// contexte egui et renvoie la palette à réutiliser dans l'interface.
+fn apply_style(ctx: &egui::Context, pref: ThemePreference) -> Palette {
+    let dark = match pref {
+        ThemePreference::Dark => true,
+        ThemePreference::Light => false,
+        ThemePreference::System => ctx.style().visuals.dark_mode,
+    };
+    let p = palette(dark);
+
+    let mut v = if dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    };
+    v.dark_mode = dark;
+    v.panel_fill = p.bg;
+    v.window_fill = p.card;
+    v.faint_bg_color = p.card_alt;
+    v.extreme_bg_color = if dark {
+        egui::Color32::from_rgb(0x0B, 0x0D, 0x11)
+    } else {
+        egui::Color32::WHITE
+    };
+    v.override_text_color = Some(p.text);
+    v.hyperlink_color = p.accent;
+    v.window_rounding = egui::Rounding::same(14.0);
+    v.menu_rounding = egui::Rounding::same(10.0);
+    v.selection.bg_fill = p.accent_soft.gamma_multiply(2.0);
+    v.selection.stroke = egui::Stroke::new(1.0, p.accent);
+    v.widgets.noninteractive =
+        widget_visuals(p.card, egui::Stroke::new(1.0, p.border), p.text);
+    v.widgets.inactive = widget_visuals(p.card_alt, egui::Stroke::new(1.0, p.border), p.text);
+    v.widgets.hovered = widget_visuals(
+        p.card_alt,
+        egui::Stroke::new(1.0, p.accent.gamma_multiply(0.7)),
+        p.text,
+    );
+    v.widgets.active =
+        widget_visuals(p.accent, egui::Stroke::new(1.0, p.accent), egui::Color32::WHITE);
+    v.widgets.open = widget_visuals(p.card, egui::Stroke::new(1.0, p.border), p.text);
+
+    let mut style = (*ctx.style()).clone();
+    style.visuals = v;
+    style.spacing.item_spacing = egui::vec2(8.0, 10.0);
+    style.spacing.button_padding = egui::vec2(14.0, 8.0);
+    style.spacing.window_margin = egui::Margin::same(16.0);
+    style.spacing.menu_margin = egui::Margin::same(8.0);
+    style.spacing.interact_size.y = 30.0;
+    style.text_styles = [
+        (
+            egui::TextStyle::Heading,
+            egui::FontId::new(21.0, egui::FontFamily::Proportional),
+        ),
+        (
+            egui::TextStyle::Body,
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        ),
+        (
+            egui::TextStyle::Monospace,
+            egui::FontId::new(13.0, egui::FontFamily::Monospace),
+        ),
+        (
+            egui::TextStyle::Button,
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        ),
+        (
+            egui::TextStyle::Small,
+            egui::FontId::new(11.5, egui::FontFamily::Proportional),
+        ),
+    ]
+    .into();
+
+    ctx.set_style(style);
+    p
+}
+
+/// Jeu de couleurs d'un widget egui, à coins arrondis et filet discret.
+fn widget_visuals(
+    bg: egui::Color32,
+    stroke: egui::Stroke,
+    fg: egui::Color32,
+) -> egui::style::WidgetVisuals {
+    egui::style::WidgetVisuals {
+        bg_fill: bg,
+        weak_bg_fill: bg,
+        bg_stroke: stroke,
+        rounding: egui::Rounding::same(10.0),
+        fg_stroke: egui::Stroke::new(1.0, fg),
+        expansion: 0.0,
+    }
+}
+
+/// Conteneur « carte » : fond contrasté, coins arrondis, filet discret.
+fn card_frame(p: &Palette) -> egui::Frame {
+    egui::Frame::none()
+        .fill(p.card)
+        .rounding(egui::Rounding::same(14.0))
+        .stroke(egui::Stroke::new(1.0, p.border))
+        .inner_margin(egui::Margin::same(14.0))
+}
+
+/// Titre de section : petites capitales discrètes.
+fn section_title(ui: &mut egui::Ui, p: &Palette, text: &str) {
+    ui.label(
+        egui::RichText::new(text.to_uppercase())
+            .size(11.0)
+            .strong()
+            .color(p.muted),
+    );
+    ui.add_space(6.0);
+}
+
+/// Vu-mètre linéaire fin, dessiné directement au peintre (aucun widget
+/// détourné) : piste `card_alt`, remplissage accent proportionnel au niveau.
+fn meter(ui: &mut egui::Ui, p: &Palette, value: f32) {
+    let (rect, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 8.0), egui::Sense::hover());
+    let painter = ui.painter();
+    painter.rect_filled(rect, egui::Rounding::same(4.0), p.card_alt);
+    let filled_width = rect.width() * value.clamp(0.0, 1.0);
+    if filled_width > 0.5 {
+        let filled = egui::Rect::from_min_size(rect.min, egui::vec2(filled_width, rect.height()));
+        painter.rect_filled(filled, egui::Rounding::same(4.0), p.accent);
+    }
+}
+
 impl eframe::App for ObsidianRecorderApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Le raccourci global et le menu System Tray peuvent démarrer/
@@ -192,15 +374,21 @@ impl eframe::App for ObsidianRecorderApp {
         // premier plan : on redessine régulièrement pour rester synchronisé.
         ctx.request_repaint_after(Duration::from_millis(500));
 
-        // Applique la préférence de thème choisie dans les réglages.
-        // "Système" laisse le thème par défaut d'eframe inchangé.
-        if let Ok(settings) = self.ctx.settings.lock() {
-            match settings.theme {
-                ThemePreference::Light => ctx.set_visuals(egui::Visuals::light()),
-                ThemePreference::Dark => ctx.set_visuals(egui::Visuals::dark()),
-                ThemePreference::System => {}
-            }
+        // Applique le thème sobre personnalisé (voir `apply_style`) et
+        // récupère la palette de couleurs partagée par toute l'interface.
+        // Le style n'est reconstruit que lorsque la préférence de thème
+        // change réellement, pas à chaque image.
+        let theme_pref = self
+            .ctx
+            .settings
+            .lock()
+            .map(|s| s.theme)
+            .unwrap_or_default();
+        if self.applied_theme != Some(theme_pref) {
+            self.palette = apply_style(ctx, theme_pref);
+            self.applied_theme = Some(theme_pref);
         }
+        let p = self.palette;
 
         // Événements du menu contextuel System Tray.
         while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
@@ -247,242 +435,458 @@ impl eframe::App for ObsidianRecorderApp {
             .map(|guard| guard.is_recording())
             .unwrap_or(false);
         let level = self.ctx.audio.lock().map(|guard| guard.level()).unwrap_or(0.0);
-        let error_color = egui::Color32::from_rgb(224, 86, 122);
+        let display_level = (level * 4.0).clamp(0.0, 1.0);
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("ObsidianRECORDER Desktop");
-            ui.label("Itération 4 — Audio, Raccourci, STT, Export Obsidian & System Tray");
-            ui.separator();
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::none()
+                    .fill(p.bg)
+                    .inner_margin(egui::Margin::same(18.0)),
+            )
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
 
-            ui.label("Microphone");
-            egui::ComboBox::from_id_source("device-select")
-                .selected_text(
-                    self.selected_device
-                        .clone()
-                        .unwrap_or_else(|| "Périphérique par défaut".to_string()),
-                )
-                .show_ui(ui, |ui| {
-                    for device in &self.devices {
-                        ui.selectable_value(&mut self.selected_device, Some(device.clone()), device);
-                    }
-                });
-
-            ui.add_space(12.0);
-
-            ui.horizontal(|ui| {
-                let color = if recording { error_color } else { egui::Color32::GRAY };
-                ui.colored_label(color, "●");
-                ui.label(if recording { "Enregistrement en cours…" } else { "Prêt" });
-            });
-
-            ui.add_space(8.0);
-            let button_label = if recording {
-                "Arrêter l'enregistrement"
-            } else {
-                "Démarrer l'enregistrement"
-            };
-            if ui.button(button_label).clicked() {
-                self.last_error = None;
-                let device = self.selected_device.clone();
-                if let Err(err) = toggle_recording(&self.ctx, device) {
-                    self.last_error = Some(err.to_string());
-                }
-            }
-
-            if let Some(err) = &self.last_error {
-                ui.add_space(6.0);
-                ui.colored_label(error_color, err);
-            }
-
-            ui.add_space(12.0);
-            ui.label(format!(
-                "Raccourci global : {DEFAULT_TOGGLE_HOTKEY} (fonctionne même en arrière-plan)"
-            ));
-            ui.small(&self.hotkey_status);
-
-            if let Ok(last) = self.ctx.last_recording.lock() {
-                if let Some(text) = last.as_ref() {
-                    ui.add_space(8.0);
-                    ui.label(format!("Dernier enregistrement : {text}"));
-                }
-            }
-
-            ui.separator();
-            ui.label("Transcription (Whisper, hors ligne)");
-            match self.ctx.stt.lock() {
-                Ok(state) => match &*state {
-                    SttState::Loading => {
-                        ui.small("Chargement du modèle…");
-                    }
-                    SttState::Unavailable(msg) => {
-                        ui.colored_label(error_color, msg);
-                    }
-                    SttState::Ready(_) => {
-                        ui.small("Modèle prêt.");
-                    }
-                    SttState::Transcribing => {
-                        ui.small("Transcription en cours…");
-                    }
-                    SttState::Done(text) => {
-                        ui.label(text);
-                    }
-                    SttState::Failed(err) => {
-                        ui.colored_label(error_color, err);
-                    }
-                },
-                Err(_) => {
-                    ui.small("État de la transcription indisponible.");
-                }
-            }
-
-            ui.separator();
-            ui.label("Vault Obsidian");
-            if ui.button("Choisir le Vault Obsidian…").clicked() {
-                self.choose_vault();
-            }
-            match &self.vault_path_display {
-                Some(path) => {
-                    ui.small(format!("Vault : {path}"));
-                }
-                None => {
-                    ui.small(
-                        "Aucun Vault configuré — la transcription reste disponible, mais \
-                         aucune note Markdown n'est écrite.",
-                    );
-                }
-            }
-            if let Some(err) = &self.vault_error {
-                ui.colored_label(error_color, err);
-            }
-            if let Ok(status) = self.ctx.note_status.lock() {
-                match &*status {
-                    NoteStatus::Idle => {}
-                    NoteStatus::Written(path) => {
-                        ui.small(format!("Note écrite : {}", path.display()));
-                    }
-                    NoteStatus::Failed(err) => {
-                        ui.colored_label(error_color, err);
-                    }
-                }
-            }
-
-            ui.separator();
-            ui.label("Notes récentes (AudioNotes)");
-            // N'inclut jamais les entrées en mode Daily Note : elles vivent
-            // dans un fichier partagé par jour, sans .wav associé en 1 pour
-            // 1 (voir vault::dashboard).
-            let mut play_request: Option<PathBuf> = None;
-            let mut stop_request = false;
-            if let Ok(vault_guard) = self.ctx.vault.lock() {
-                match vault_guard.as_ref() {
-                    Some(vault) => {
-                        let notes = obsidianrecorder_lib::vault::dashboard::list_recent_notes(
-                            &vault.resolve(AUDIO_NOTES_SUBFOLDER),
-                            5,
+                        // En-tête : titre, sous-titre et filet d'accent.
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Obsidian")
+                                    .size(23.0)
+                                    .strong()
+                                    .color(p.text),
+                            );
+                            ui.label(
+                                egui::RichText::new("RECORDER")
+                                    .size(23.0)
+                                    .strong()
+                                    .color(p.accent),
+                            );
+                        });
+                        ui.label(
+                            egui::RichText::new(
+                                "Mémos vocaux locaux · Whisper hors ligne · export Obsidian",
+                            )
+                            .size(12.0)
+                            .color(p.muted),
                         );
-                        if notes.is_empty() {
-                            ui.small("Aucune note pour le moment.");
-                        } else {
-                            for note in &notes {
-                                ui.horizontal(|ui| {
-                                    ui.label(format!(
-                                        "{} — {}",
-                                        note.date_label.as_deref().unwrap_or("date inconnue"),
-                                        note.duration_label.as_deref().unwrap_or("durée inconnue"),
-                                    ));
-                                    let playing = self.playback.is_playing();
-                                    let label = if playing { "Pause" } else { "Écouter" };
-                                    if ui.button(label).clicked() {
-                                        if playing {
-                                            stop_request = true;
-                                        } else if let Some(stem) =
-                                            note.path.file_stem().and_then(|s| s.to_str())
-                                        {
-                                            play_request = Some(
-                                                vault
-                                                    .resolve(ATTACHMENTS_SUBFOLDER)
-                                                    .join(format!("{stem}.wav")),
+                        ui.add_space(10.0);
+                        let header_line = ui.available_rect_before_wrap();
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_size(
+                                header_line.min,
+                                egui::vec2(header_line.width(), 2.0),
+                            ),
+                            egui::Rounding::same(1.0),
+                            p.accent,
+                        );
+                        ui.add_space(14.0);
+
+                        // Carte « Enregistrement ».
+                        card_frame(&p).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            section_title(ui, &p, "Enregistrement");
+
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("Microphone").size(12.0).color(p.muted),
+                                );
+                                egui::ComboBox::from_id_source("device-select")
+                                    .selected_text(
+                                        self.selected_device.clone().unwrap_or_else(|| {
+                                            "Périphérique par défaut".to_string()
+                                        }),
+                                    )
+                                    .width(ui.available_width().max(140.0))
+                                    .show_ui(ui, |ui| {
+                                        for device in &self.devices {
+                                            ui.selectable_value(
+                                                &mut self.selected_device,
+                                                Some(device.clone()),
+                                                device,
                                             );
                                         }
-                                    }
-                                });
+                                    });
+                            });
+
+                            ui.add_space(10.0);
+                            ui.horizontal(|ui| {
+                                let (dot, label) = if recording {
+                                    (p.danger, "Enregistrement en cours…")
+                                } else {
+                                    (p.ok, "Prêt")
+                                };
+                                ui.label(egui::RichText::new("●").size(13.0).color(dot));
+                                ui.label(egui::RichText::new(label).color(p.text));
+                            });
+
+                            if recording {
+                                ui.add_space(8.0);
+                                meter(ui, &p, display_level);
                             }
-                        }
-                    }
-                    None => {
-                        ui.small("Configurez un Vault pour voir vos notes récentes ici.");
-                    }
-                }
-            }
-            if stop_request {
-                let _ = self.playback.stop();
-            }
-            if let Some(path) = play_request {
-                if let Err(err) = self.playback.play(&path) {
-                    self.last_error = Some(err.to_string());
-                }
-            }
-            self.playback.poll_finished();
 
-            ui.separator();
-            ui.checkbox(&mut self.show_settings, "Réglages");
-            if self.show_settings {
-                ui.group(|ui| {
-                    if let Ok(mut settings) = self.ctx.settings.lock() {
-                        ui.label("Mode d'écriture des notes");
-                        let mut mode_changed = false;
-                        mode_changed |= ui
-                            .radio_value(
-                                &mut settings.write_mode,
-                                WriteModeSetting::NewFile,
-                                "Nouvelle note horodatée",
+                            ui.add_space(12.0);
+                            let (fill, label) = if recording {
+                                (p.danger, "Arrêter l'enregistrement")
+                            } else {
+                                (p.accent, "Démarrer l'enregistrement")
+                            };
+                            let record_button = egui::Button::new(
+                                egui::RichText::new(label)
+                                    .size(15.0)
+                                    .strong()
+                                    .color(egui::Color32::WHITE),
                             )
-                            .clicked();
-                        mode_changed |= ui
-                            .radio_value(
-                                &mut settings.write_mode,
-                                WriteModeSetting::DailyNote,
-                                "Ajouter à la Daily Note du jour",
+                            .fill(fill)
+                            .rounding(egui::Rounding::same(10.0));
+                            if ui
+                                .add_sized([ui.available_width(), 42.0], record_button)
+                                .clicked()
+                            {
+                                self.last_error = None;
+                                let device = self.selected_device.clone();
+                                if let Err(err) = toggle_recording(&self.ctx, device) {
+                                    self.last_error = Some(err.to_string());
+                                }
+                            }
+
+                            if let Some(err) = &self.last_error {
+                                ui.add_space(8.0);
+                                ui.label(egui::RichText::new(err.as_str()).color(p.danger));
+                            }
+
+                            ui.add_space(10.0);
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "Raccourci global : {DEFAULT_TOGGLE_HOTKEY} · actif en arrière-plan"
+                                ))
+                                .size(11.5)
+                                .color(p.muted),
+                            );
+                            ui.label(
+                                egui::RichText::new(self.hotkey_status.as_str())
+                                    .size(11.0)
+                                    .color(p.muted),
+                            );
+
+                            if let Ok(last) = self.ctx.last_recording.lock() {
+                                if let Some(text) = last.as_ref() {
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "Dernier enregistrement : {text}"
+                                        ))
+                                        .size(11.5)
+                                        .color(p.muted),
+                                    );
+                                }
+                            }
+                        });
+
+                        ui.add_space(12.0);
+
+                        // Carte « Transcription ».
+                        card_frame(&p).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            section_title(ui, &p, "Transcription · Whisper hors ligne");
+                            match self.ctx.stt.lock() {
+                                Ok(state) => match &*state {
+                                    SttState::Loading => {
+                                        ui.label(
+                                            egui::RichText::new("Chargement du modèle…")
+                                                .color(p.muted),
+                                        );
+                                    }
+                                    SttState::Unavailable(msg) => {
+                                        ui.label(egui::RichText::new(msg.as_str()).color(p.danger));
+                                    }
+                                    SttState::Ready(_) => {
+                                        ui.label(egui::RichText::new("Modèle prêt.").color(p.ok));
+                                    }
+                                    SttState::Transcribing => {
+                                        ui.label(
+                                            egui::RichText::new("Transcription en cours…")
+                                                .color(p.muted),
+                                        );
+                                    }
+                                    SttState::Done(text) => {
+                                        ui.label(egui::RichText::new(text.as_str()).color(p.text));
+                                    }
+                                    SttState::Failed(err) => {
+                                        ui.label(egui::RichText::new(err.as_str()).color(p.danger));
+                                    }
+                                },
+                                Err(_) => {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "État de la transcription indisponible.",
+                                        )
+                                        .color(p.muted),
+                                    );
+                                }
+                            }
+                        });
+
+                        ui.add_space(12.0);
+
+                        // Carte « Vault Obsidian ».
+                        card_frame(&p).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            section_title(ui, &p, "Vault Obsidian");
+
+                            let choose = egui::Button::new(
+                                egui::RichText::new("Choisir le Vault Obsidian…").color(p.text),
                             )
-                            .clicked();
+                            .fill(p.card_alt)
+                            .stroke(egui::Stroke::new(1.0, p.border))
+                            .rounding(egui::Rounding::same(10.0));
+                            if ui
+                                .add_sized([ui.available_width(), 34.0], choose)
+                                .clicked()
+                            {
+                                self.choose_vault();
+                            }
 
-                        ui.add_space(8.0);
-                        ui.label("Thème");
-                        let mut theme_changed = false;
-                        theme_changed |= ui
-                            .radio_value(&mut settings.theme, ThemePreference::System, "Système")
-                            .clicked();
-                        theme_changed |= ui
-                            .radio_value(&mut settings.theme, ThemePreference::Light, "Clair")
-                            .clicked();
-                        theme_changed |= ui
-                            .radio_value(&mut settings.theme, ThemePreference::Dark, "Sombre")
-                            .clicked();
+                            ui.add_space(8.0);
+                            match &self.vault_path_display {
+                                Some(path) => {
+                                    ui.label(
+                                        egui::RichText::new(format!("Vault : {path}"))
+                                            .size(11.5)
+                                            .color(p.muted),
+                                    );
+                                }
+                                None => {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Aucun Vault configuré — la transcription reste \
+                                             disponible, mais aucune note Markdown n'est écrite.",
+                                        )
+                                        .size(11.5)
+                                        .color(p.muted),
+                                    );
+                                }
+                            }
+                            if let Some(err) = &self.vault_error {
+                                ui.add_space(6.0);
+                                ui.label(egui::RichText::new(err.as_str()).color(p.danger));
+                            }
+                            if let Ok(status) = self.ctx.note_status.lock() {
+                                match &*status {
+                                    NoteStatus::Idle => {}
+                                    NoteStatus::Written(path) => {
+                                        ui.add_space(6.0);
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "Note écrite : {}",
+                                                path.display()
+                                            ))
+                                            .size(11.5)
+                                            .color(p.ok),
+                                        );
+                                    }
+                                    NoteStatus::Failed(err) => {
+                                        ui.add_space(6.0);
+                                        ui.label(
+                                            egui::RichText::new(err.as_str()).color(p.danger),
+                                        );
+                                    }
+                                }
+                            }
+                        });
 
-                        if mode_changed || theme_changed {
-                            let _ = settings::save(&settings);
-                        }
-                    }
-                });
+                        ui.add_space(12.0);
 
-                ui.add_space(8.0);
-                ui.label("Tags supplémentaires (séparés par des virgules)");
-                if ui.text_edit_singleline(&mut self.tags_input).changed() {
-                    if let Ok(mut settings) = self.ctx.settings.lock() {
-                        settings.extra_tags = self
-                            .tags_input
-                            .split(',')
-                            .map(|s| s.trim().to_string())
-                            .filter(|s| !s.is_empty())
-                            .collect();
-                        let _ = settings::save(&settings);
-                    }
-                }
-            }
+                        // Carte « Notes récentes ».
+                        card_frame(&p).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            section_title(ui, &p, "Notes récentes · AudioNotes");
+                            // N'inclut jamais les entrées en mode Daily Note : elles vivent
+                            // dans un fichier partagé par jour, sans .wav associé en 1 pour
+                            // 1 (voir vault::dashboard).
+                            let mut play_request: Option<PathBuf> = None;
+                            let mut stop_request = false;
+                            if let Ok(vault_guard) = self.ctx.vault.lock() {
+                                match vault_guard.as_ref() {
+                                    Some(vault) => {
+                                        let notes =
+                                            obsidianrecorder_lib::vault::dashboard::list_recent_notes(
+                                                &vault.resolve(AUDIO_NOTES_SUBFOLDER),
+                                                5,
+                                            );
+                                        if notes.is_empty() {
+                                            ui.label(
+                                                egui::RichText::new(
+                                                    "Aucune note pour le moment.",
+                                                )
+                                                .size(12.0)
+                                                .color(p.muted),
+                                            );
+                                        } else {
+                                            for note in &notes {
+                                                ui.horizontal(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(format!(
+                                                            "{} — {}",
+                                                            note.date_label
+                                                                .as_deref()
+                                                                .unwrap_or("date inconnue"),
+                                                            note.duration_label
+                                                                .as_deref()
+                                                                .unwrap_or("durée inconnue"),
+                                                        ))
+                                                        .size(12.0)
+                                                        .color(p.text),
+                                                    );
+                                                    let playing = self.playback.is_playing();
+                                                    let label =
+                                                        if playing { "Pause" } else { "Écouter" };
+                                                    let small_button = egui::Button::new(
+                                                        egui::RichText::new(label)
+                                                            .size(11.5)
+                                                            .color(p.accent),
+                                                    )
+                                                    .fill(p.accent_soft)
+                                                    .stroke(egui::Stroke::new(1.0, p.accent))
+                                                    .rounding(egui::Rounding::same(8.0));
+                                                    if ui.add(small_button).clicked() {
+                                                        if playing {
+                                                            stop_request = true;
+                                                        } else if let Some(stem) = note
+                                                            .path
+                                                            .file_stem()
+                                                            .and_then(|s| s.to_str())
+                                                        {
+                                                            play_request = Some(
+                                                                vault
+                                                                    .resolve(ATTACHMENTS_SUBFOLDER)
+                                                                    .join(format!("{stem}.wav")),
+                                                            );
+                                                        }
+                                                    }
+                                                });
+                                            }
+                                        }
+                                    }
+                                    None => {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "Configurez un Vault pour voir vos notes récentes ici.",
+                                            )
+                                            .size(12.0)
+                                            .color(p.muted),
+                                        );
+                                    }
+                                }
+                            }
+                            if stop_request {
+                                let _ = self.playback.stop();
+                            }
+                            if let Some(path) = play_request {
+                                if let Err(err) = self.playback.play(&path) {
+                                    self.last_error = Some(err.to_string());
+                                }
+                            }
+                            self.playback.poll_finished();
+                        });
 
-            ui.add_space(6.0);
-            ui.small(&self.tray_status);
-        });
+                        ui.add_space(12.0);
+
+                        // Carte « Réglages » (repliée par défaut).
+                        card_frame(&p).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.checkbox(
+                                &mut self.show_settings,
+                                egui::RichText::new("Réglages").color(p.text),
+                            );
+
+                            if self.show_settings {
+                                ui.add_space(10.0);
+                                if let Ok(mut settings) = self.ctx.settings.lock() {
+                                    ui.label(
+                                        egui::RichText::new("Mode d'écriture des notes")
+                                            .size(12.0)
+                                            .color(p.muted),
+                                    );
+                                    let mut mode_changed = false;
+                                    mode_changed |= ui
+                                        .radio_value(
+                                            &mut settings.write_mode,
+                                            WriteModeSetting::NewFile,
+                                            "Nouvelle note horodatée",
+                                        )
+                                        .clicked();
+                                    mode_changed |= ui
+                                        .radio_value(
+                                            &mut settings.write_mode,
+                                            WriteModeSetting::DailyNote,
+                                            "Ajouter à la Daily Note du jour",
+                                        )
+                                        .clicked();
+
+                                    ui.add_space(10.0);
+                                    ui.label(
+                                        egui::RichText::new("Thème")
+                                            .size(12.0)
+                                            .color(p.muted),
+                                    );
+                                    let mut theme_changed = false;
+                                    theme_changed |= ui
+                                        .radio_value(
+                                            &mut settings.theme,
+                                            ThemePreference::System,
+                                            "Système",
+                                        )
+                                        .clicked();
+                                    theme_changed |= ui
+                                        .radio_value(
+                                            &mut settings.theme,
+                                            ThemePreference::Light,
+                                            "Clair",
+                                        )
+                                        .clicked();
+                                    theme_changed |= ui
+                                        .radio_value(
+                                            &mut settings.theme,
+                                            ThemePreference::Dark,
+                                            "Sombre",
+                                        )
+                                        .clicked();
+
+                                    if mode_changed || theme_changed {
+                                        let _ = settings::save(&settings);
+                                    }
+
+                                    ui.add_space(10.0);
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "Tags supplémentaires (séparés par des virgules)",
+                                        )
+                                        .size(12.0)
+                                        .color(p.muted),
+                                    );
+                                    if ui.text_edit_singleline(&mut self.tags_input).changed() {
+                                        settings.extra_tags = self
+                                            .tags_input
+                                            .split(',')
+                                            .map(|s| s.trim().to_string())
+                                            .filter(|s| !s.is_empty())
+                                            .collect();
+                                        let _ = settings::save(&settings);
+                                    }
+                                }
+                            }
+                        });
+
+                        ui.add_space(14.0);
+                        ui.label(
+                            egui::RichText::new(self.tray_status.as_str())
+                                .size(11.0)
+                                .color(p.muted),
+                        );
+                    });
+            });
 
         // Mini-overlay flottant : visible uniquement pendant un
         // enregistrement actif. Une « immediate viewport » egui ne reste
@@ -496,12 +900,14 @@ impl eframe::App for ObsidianRecorderApp {
         // barre de niveau lisible (le RMS brut d'une voix normale reste
         // visuellement très bas sur une échelle [0.0, 1.0]).
         if recording {
-            let display_level = (level * 4.0).clamp(0.0, 1.0);
+            // Le style de la fenêtre principale (déjà appliqué ci-dessus au
+            // contexte partagé) vaut aussi pour cette viewport immédiate :
+            // l'overlay hérite donc de la même palette, sans re-calcul.
             ctx.show_viewport_immediate(
                 egui::ViewportId::from_hash_of("obsidianrecorder-level-overlay"),
                 egui::ViewportBuilder::default()
                     .with_title("ObsidianRECORDER")
-                    .with_inner_size([220.0, 70.0])
+                    .with_inner_size([240.0, 78.0])
                     .with_always_on_top()
                     .with_decorations(false)
                     .with_resizable(false),
@@ -509,10 +915,25 @@ impl eframe::App for ObsidianRecorderApp {
                     if class != egui::ViewportClass::Immediate {
                         return;
                     }
-                    egui::CentralPanel::default().show(overlay_ctx, |ui| {
-                        ui.label("● Enregistrement en cours");
-                        ui.add(egui::ProgressBar::new(display_level));
-                    });
+                    egui::CentralPanel::default()
+                        .frame(
+                            egui::Frame::none()
+                                .fill(p.card)
+                                .inner_margin(egui::Margin::same(12.0)),
+                        )
+                        .show(overlay_ctx, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("●").size(12.0).color(p.danger));
+                                ui.label(
+                                    egui::RichText::new("Enregistrement en cours")
+                                        .size(12.0)
+                                        .strong()
+                                        .color(p.text),
+                                );
+                            });
+                            ui.add_space(8.0);
+                            meter(ui, &p, display_level);
+                        });
                 },
             );
         }

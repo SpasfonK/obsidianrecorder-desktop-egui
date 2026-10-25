@@ -71,9 +71,15 @@ jobs:
       - name: Build release
         run: cargo build --release --verbose
 
+      # Le modèle Whisper (~574 Mo) n'est pas embarqué : il se télécharge une
+      # fois à côté de l'exécutable (voir src/stt/model.rs::models_dir, qui
+      # pointe sur le dossier de l'exe). Le script est joint à l'artefact
+      # pour que le dossier extrait reste auto-suffisant et portable.
       - name: Publication du binaire portable
         uses: actions/upload-artifact@v4
         with:
           name: ObsidianRECORDER-Desktop-portable
-          path: target/release/obsidianrecorder-desktop.exe
+          path: |
+            target/release/obsidianrecorder-desktop.exe
+            scripts/download-model.ps1
           if-no-files-found: error

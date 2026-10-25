@@ -11,7 +11,7 @@ use eframe::egui;
 fn main() -> eframe::Result {
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([480.0, 640.0])
+            .with_inner_size([520.0, 720.0])
             .with_min_inner_size([380.0, 480.0])
             .with_icon(load_icon())
             .with_title("ObsidianRECORDER Desktop"),

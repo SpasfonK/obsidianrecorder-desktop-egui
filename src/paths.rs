@@ -1,7 +1,18 @@
 //! Emplacements par défaut utilisés tant que la sélection du Vault
 //! Obsidian (Itération 3) n'est pas encore implémentée dans l'interface.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Dossier de l'exécutable courant : base de la distribution **portable**
+/// de l'application. Le modèle Whisper (voir `stt::model`) y est cherché
+/// directement, à côté du `.exe`, pour que le dossier reste auto-suffisant
+/// et déplaçable tel quel, sans rien écrire dans le profil utilisateur.
+pub fn portable_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| PathBuf::from("."))
+}
 
 /// Dossier de secours où sont déposés les enregistrements :
 /// `Documents\ObsidianRECORDER` dans le profil de l'utilisateur Windows
@@ -19,4 +30,26 @@ pub fn fallback_recordings_dir() -> PathBuf {
 /// frontmatter Markdown des itérations suivantes.
 pub fn timestamped_wav_filename() -> String {
     format!("rec_{}.wav", chrono::Local::now().format("%Y%m%d_%H%M%S"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portable_dir_is_an_existing_directory() {
+        let dir = portable_dir();
+        assert!(
+            dir.is_dir(),
+            "portable_dir() doit désigner un dossier existant : {}",
+            dir.display()
+        );
+    }
+
+    #[test]
+    fn portable_dir_is_the_current_executable_parent() {
+        let exe = std::env::current_exe().expect("current_exe() doit être disponible en test");
+        let parent = exe.parent().expect("l'exécutable doit avoir un dossier parent");
+        assert_eq!(portable_dir(), parent.to_path_buf());
+    }
 }
