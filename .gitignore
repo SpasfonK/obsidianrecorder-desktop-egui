@@ -1,0 +1,13 @@
+# Rust
+/target
+
+# Modèle Whisper (téléchargé localement, jamais committé — voir scripts/download-model.ps1)
+*.bin
+
+# Fixture audio de test (contient une vraie voix, personnelle — voir tests/fixtures/README.md)
+tests/fixtures/*.wav
+
+# Divers
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,70 @@
+[package]
+name = "obsidianrecorder-desktop"
+version = "0.7.0"
+edition = "2021"
+description = "ObsidianRECORDER Desktop – enregistreur de mémos vocaux local, sans dépendance externe : capture audio, raccourci clavier global, STT hors ligne (Whisper), export Markdown vers un Vault Obsidian, dashboard avec lecture audio, icône System Tray, mini-overlay vu-mètre live, interface native egui"
+authors = ["SpasfonK"]
+license = "MIT"
+rust-version = "1.77"
+
+[lib]
+name = "obsidianrecorder_lib"
+crate-type = ["rlib"]
+path = "src/lib.rs"
+
+[[bin]]
+name = "obsidianrecorder-desktop"
+path = "src/main.rs"
+
+[dependencies]
+# Interface native (rendu OpenGL via `glow`, déjà présent avec n'importe quel
+# pilote graphique Windows) : zéro WebView2, zéro Node/npm, zéro runtime à
+# installer. Version épinglée en-deçà du récent renommage App::update →
+# App::ui (voir README, section « Limites connues ») pour rester sur une
+# surface d'API la mieux établie.
+eframe = "0.28"
+egui = "0.28"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Socle audio/hotkey (inchangé depuis l'itération précédente)
+cpal = "0.15"
+hound = "3.5"
+global-hotkey = "0.7"
+
+# Reconnaissance vocale hors ligne : liaisons Rust vers whisper.cpp, compilé
+# et lié STATIQUEMENT dans le binaire (aucun .dll séparé à distribuer). Le
+# modèle GGML, lui, reste un fichier externe téléchargé une fois — voir
+# src/stt/model.rs et scripts/download-model.ps1. Nécessite un compilateur
+# C++, CMake et libclang (bindgen) au moment de la COMPILATION uniquement ;
+# voir le CI et le README, section « Limites connues », pour le détail.
+whisper-rs = "0.16"
+
+thiserror = "1"
+chrono = { version = "0.4", features = ["clock"] }
+
+# Sélecteur de dossier natif (boîte de dialogue Windows standard, API COM
+# déjà présente sur le système) : zéro dépendance supplémentaire à installer,
+# cohérent avec le reste du projet.
+rfd = "0.15"
+
+# Écriture atomique des notes (voir vault::writer) : utilisé en production,
+# pas seulement dans les tests, d'où sa présence ici plutôt qu'en
+# dev-dependencies.
+tempfile = "3"
+
+# Réglages persistés (voir settings.rs) : un simple fichier JSON local,
+# aucun impact runtime (compilé statiquement, comme tout le reste).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Icône et menu System Tray. Même organisation (tauri-apps) et même design
+# que global-hotkey : contrainte Send/thread principal identique, gérée de
+# la même façon (voir app.rs::setup_tray_icon).
+tray-icon = "0.20"
+
+# Empreinte disque/mémoire minimale (cahier des charges, section 2).
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
