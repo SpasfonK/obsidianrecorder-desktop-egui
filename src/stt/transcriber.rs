@@ -100,21 +100,19 @@ impl Transcriber {
             .full(params, samples)
             .map_err(|e| SttError::Inference(e.to_string()))?;
 
-        let segment_count = state
-            .full_n_segments()
-            .map_err(|e| SttError::Inference(e.to_string()))?;
-
+        let segment_count = state.full_n_segments();
         let mut segments = Vec::with_capacity(segment_count.max(0) as usize);
         for i in 0..segment_count {
-            let text = state
-                .full_get_segment_text(i)
+            let segment = state
+                .get_segment(i)
+                .ok_or_else(|| SttError::Inference(format!("segment {i} absent de l'état Whisper")))?;
+            let text = segment
+                .to_str()
                 .map_err(|e| SttError::Inference(e.to_string()))?;
-            let start_cs = state.full_get_segment_t0(i).unwrap_or(0) as i64;
-            let end_cs = state.full_get_segment_t1(i).unwrap_or(0) as i64;
             segments.push(TranscriptSegment {
-                start_cs,
-                end_cs,
-                text: normalize_text(&text),
+                start_cs: segment.start_timestamp(),
+                end_cs: segment.end_timestamp(),
+                text: normalize_text(text),
             });
         }
 
