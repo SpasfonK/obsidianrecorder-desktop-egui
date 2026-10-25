@@ -115,7 +115,18 @@ fn append_to_daily_note(daily_notes_dir: &Path, section: &str) -> VaultResult<Pa
 /// indexeur de fichiers (Obsidian, antivirus, etc.) qui observerait ce
 /// dossier ne voit donc jamais un fichier à moitié écrit : seulement
 /// l'ancienne version complète, ou la nouvelle.
+///
+/// Sous Windows, remplacer un fichier qu'un autre handle tient ouvert
+/// (Obsidian en train de lire la note, antivirus, indexeur du système)
+/// échoue avec `ERROR_ACCESS_DENIED` (5) ou `ERROR_SHARING_VIOLATION`
+/// (32) — contrairement à POSIX, le renommage n'est pas inconditionnel.
+/// Ces verrous sont transitoires : on retente quelques fois avant
+/// d'abandonner, plutôt que de faire échouer l'enregistrement d'une note
+/// pour une collision de quelques microsecondes.
 fn atomic_write(path: &Path, content: &str) -> VaultResult<()> {
+    const MAX_ATTEMPTS: u32 = 20;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
+
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let mut tmp = tempfile::Builder::new()
         .prefix(".obsidianrecorder-tmp-")
@@ -123,8 +134,26 @@ fn atomic_write(path: &Path, content: &str) -> VaultResult<()> {
         .tempfile_in(dir)?;
     tmp.write_all(content.as_bytes())?;
     tmp.flush()?;
-    tmp.persist(path).map_err(|e| VaultError::Io(e.error))?;
-    Ok(())
+
+    let mut attempt = 1;
+    loop {
+        // `persist` consomme le fichier temporaire : en cas d'échec, il le
+        // restitue (`PersistError::file`) pour permettre une nouvelle
+        // tentative sans réécrire le contenu.
+        match tmp.persist(path) {
+            Ok(_) => return Ok(()),
+            Err(e) => {
+                let transient = e.error.kind() == std::io::ErrorKind::PermissionDenied
+                    || matches!(e.error.raw_os_error(), Some(5) | Some(32));
+                if !transient || attempt >= MAX_ATTEMPTS {
+                    return Err(VaultError::Io(e.error));
+                }
+                attempt += 1;
+                tmp = e.file;
+                std::thread::sleep(RETRY_DELAY);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
