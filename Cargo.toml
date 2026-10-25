@@ -62,6 +62,14 @@ serde_json = "1"
 # la même façon (voir app.rs::setup_tray_icon).
 tray-icon = "0.20"
 
+# Décodage de fichiers audio externes pour l'import en transcription
+# différée (voir audio::import) : MP3 et M4A/AAC, en 100 % Rust pur — aucune
+# dépendance système (pas de ffmpeg/lame à installer), cohérent avec le
+# reste du projet. Le WAV, lui, reste géré par `hound` (déjà présent).
+# Épinglé sur la branche 0.5 : la 0.6 réorganise l'API des codecs
+# (voir README, section « Limites connues »).
+symphonia = { version = "0.5.4", default-features = false, features = ["mp3", "isomp4", "aac"] }
+
 # Empreinte disque/mémoire minimale (cahier des charges, section 2).
 [profile.release]
 opt-level = "s"

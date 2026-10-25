@@ -49,6 +49,9 @@ pub enum AudioError {
 
     #[error("aucune lecture audio n'est en cours")]
     NotPlaying,
+
+    #[error("impossible de décoder le fichier audio importé : {0}")]
+    Decode(String),
 }
 
 pub type AudioResult<T> = Result<T, AudioError>;

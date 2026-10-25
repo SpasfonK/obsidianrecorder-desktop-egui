@@ -17,7 +17,7 @@
 //! traversent la frontière entre threads.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -56,6 +56,11 @@ pub struct AudioCapture {
     /// l'arrêt. Partagé (`Arc`) avec le thread de capture, jamais déplacé
     /// lui-même entre threads après construction.
     level: Arc<AtomicU32>,
+    /// `true` tant que la grille anti-silence (voir [`SilenceGate`])
+    /// écrit effectivement les trames reçues dans le fichier WAV ; `false`
+    /// pendant une pause automatique due à un silence prolongé. Toujours
+    /// `true` hors enregistrement ou quand le seuil est désactivé (0.0).
+    gate_open: Arc<AtomicBool>,
 }
 
 impl AudioCapture {
@@ -64,6 +69,7 @@ impl AudioCapture {
             control_tx: None,
             worker: None,
             level: Arc::new(AtomicU32::new(0)),
+            gate_open: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -77,12 +83,26 @@ impl AudioCapture {
         f32::from_bits(self.level.load(Ordering::Relaxed))
     }
 
+    /// `false` si l'enregistrement en cours est actuellement en pause à
+    /// cause d'un silence prolongé (voir [`SilenceGate`]) ; `true` dans
+    /// tous les autres cas, y compris hors enregistrement.
+    pub fn is_gate_open(&self) -> bool {
+        self.gate_open.load(Ordering::Relaxed)
+    }
+
     /// Démarre un enregistrement vers `output_path`, sur le périphérique
     /// nommé `device_name` (ou le périphérique d'entrée par défaut si
-    /// `None`). Bloque brièvement le temps que le thread de capture
+    /// `None`). `silence_threshold` règle la grille anti-silence (voir
+    /// [`SilenceGate`]) : `0.0` l'désactive (tout est enregistré, comportement
+    /// historique). Bloque brièvement le temps que le thread de capture
     /// confirme que le flux audio a bien démarré, afin qu'un `stop()`
     /// immédiat ne puisse jamais arriver avant que le flux ne soit prêt.
-    pub fn start(&mut self, device_name: Option<String>, output_path: PathBuf) -> AudioResult<()> {
+    pub fn start(
+        &mut self,
+        device_name: Option<String>,
+        output_path: PathBuf,
+        silence_threshold: f32,
+    ) -> AudioResult<()> {
         if self.worker.is_some() {
             return Err(AudioError::AlreadyRecording);
         }
@@ -90,10 +110,22 @@ impl AudioCapture {
         let (control_tx, control_rx) = mpsc::channel::<CaptureCommand>();
         let (ready_tx, ready_rx) = mpsc::channel::<AudioResult<()>>();
         let level = Arc::clone(&self.level);
+        let gate_open = Arc::clone(&self.gate_open);
+        gate_open.store(true, Ordering::Relaxed);
 
         let worker = thread::Builder::new()
             .name("obsidianrecorder-audio-capture".into())
-            .spawn(move || run_capture_thread(device_name, output_path, control_rx, ready_tx, level))
+            .spawn(move || {
+                run_capture_thread(
+                    device_name,
+                    output_path,
+                    silence_threshold,
+                    control_rx,
+                    ready_tx,
+                    level,
+                    gate_open,
+                )
+            })
             .map_err(|e| AudioError::BuildStream(e.to_string()))?;
 
         match ready_rx.recv() {
@@ -133,8 +165,10 @@ impl AudioCapture {
 
         // Le vu-mètre de l'interface doit retomber à zéro une fois
         // l'enregistrement arrêté, pas rester bloqué sur la dernière valeur
-        // mesurée avant l'arrêt.
+        // mesurée avant l'arrêt. Idem pour l'indicateur de pause : un
+        // enregistrement arrêté ne doit jamais s'afficher « en pause ».
         self.level.store(0.0_f32.to_bits(), Ordering::Relaxed);
+        self.gate_open.store(true, Ordering::Relaxed);
         outcome
     }
 }
@@ -150,11 +184,13 @@ impl Default for AudioCapture {
 fn run_capture_thread(
     device_name: Option<String>,
     output_path: PathBuf,
+    silence_threshold: f32,
     control_rx: mpsc::Receiver<CaptureCommand>,
     ready_tx: mpsc::Sender<AudioResult<()>>,
     level: Arc<AtomicU32>,
+    gate_open: Arc<AtomicBool>,
 ) -> AudioResult<RecordingSummary> {
-    let setup = setup_stream(device_name, &output_path, level);
+    let setup = setup_stream(device_name, &output_path, silence_threshold, level, gate_open);
 
     let (stream, writer) = match setup {
         Ok(pair) => {
@@ -191,7 +227,9 @@ fn run_capture_thread(
 fn setup_stream(
     device_name: Option<String>,
     output_path: &std::path::Path,
+    silence_threshold: f32,
     level: Arc<AtomicU32>,
+    gate_open: Arc<AtomicBool>,
 ) -> AudioResult<(cpal::Stream, Arc<Mutex<RecordingWavWriter>>)> {
     let host = cpal::default_host();
     let device = select_input_device(&host, device_name.as_deref())?;
@@ -216,6 +254,8 @@ fn setup_stream(
         source_channels,
         Arc::clone(&writer),
         level,
+        SilenceGate::new(silence_threshold),
+        gate_open,
     )?;
     stream
         .play()
@@ -224,9 +264,67 @@ fn setup_stream(
     Ok((stream, writer))
 }
 
+/// Grille anti-silence (« noise gate ») à seuil configurable et temps de
+/// maintien (« hold ») : évite de couper un mot dont le niveau retombe
+/// brièvement sous le seuil entre deux syllabes, tout en permettant de ne
+/// pas écrire les silences prolongés dans le fichier WAV final (voir
+/// `Settings::capture_threshold`).
+///
+/// Purement fonctionnelle (aucune dépendance système) : testable
+/// unitairement comme le reste du pipeline DSP (voir `super::dsp`).
+struct SilenceGate {
+    threshold: f32,
+    hold: Duration,
+    open: bool,
+    below_since: Option<Duration>,
+    elapsed: Duration,
+}
+
+impl SilenceGate {
+    /// `threshold <= 0.0` désactive totalement la grille : `update`
+    /// retourne alors toujours `true` (comportement historique conservé
+    /// par défaut, voir `Settings::capture_threshold`).
+    fn new(threshold: f32) -> Self {
+        Self {
+            threshold,
+            hold: Duration::from_millis(500),
+            open: true,
+            below_since: None,
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    fn disabled(&self) -> bool {
+        self.threshold <= 0.0
+    }
+
+    /// Met à jour la grille avec le niveau RMS d'une trame fraîchement
+    /// reçue (durée `frame_duration`, déduite de sa taille et de la
+    /// fréquence native du périphérique) et indique si cette trame doit
+    /// être écrite dans le fichier WAV.
+    fn update(&mut self, rms: f32, frame_duration: Duration) -> bool {
+        if self.disabled() {
+            return true;
+        }
+        self.elapsed += frame_duration;
+        if rms >= self.threshold {
+            self.open = true;
+            self.below_since = None;
+        } else {
+            let since = *self.below_since.get_or_insert(self.elapsed);
+            if self.elapsed.saturating_sub(since) >= self.hold {
+                self.open = false;
+            }
+        }
+        self.open
+    }
+}
+
 /// Construit le flux d'entrée `cpal` correspondant au format d'échantillon
-/// natif du périphérique, en branchant le pipeline downmix → resample →
-/// quantification → écriture WAV sur chaque trame reçue.
+/// natif du périphérique, en branchant le pipeline downmix → grille
+/// anti-silence → resample → quantification → écriture WAV sur chaque
+/// trame reçue.
+#[allow(clippy::too_many_arguments)]
 fn build_stream(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -235,6 +333,8 @@ fn build_stream(
     source_channels: u16,
     writer: Arc<Mutex<RecordingWavWriter>>,
     level: Arc<AtomicU32>,
+    mut gate: SilenceGate,
+    gate_open: Arc<AtomicBool>,
 ) -> AudioResult<cpal::Stream> {
     let err_fn = move |err: cpal::StreamError| {
         eprintln!("[obsidianrecorder] erreur du flux audio d'entrée : {err}");
@@ -245,8 +345,15 @@ fn build_stream(
             config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 let mono = downmix_f32_to_mono(data, source_channels);
-                update_level(&level, &mono);
-                ingest_frame(&mono, source_rate, &writer);
+                let rms = compute_rms(&mono);
+                update_level(&level, rms);
+                let frame_duration =
+                    Duration::from_secs_f64(mono.len() as f64 / source_rate.max(1) as f64);
+                let should_write = gate.update(rms, frame_duration);
+                gate_open.store(should_write, Ordering::Relaxed);
+                if should_write {
+                    ingest_frame(&mono, source_rate, &writer);
+                }
             },
             err_fn,
             None,
@@ -255,8 +362,15 @@ fn build_stream(
             config,
             move |data: &[i16], _: &cpal::InputCallbackInfo| {
                 let mono = downmix_i16_to_mono_f32(data, source_channels);
-                update_level(&level, &mono);
-                ingest_frame(&mono, source_rate, &writer);
+                let rms = compute_rms(&mono);
+                update_level(&level, rms);
+                let frame_duration =
+                    Duration::from_secs_f64(mono.len() as f64 / source_rate.max(1) as f64);
+                let should_write = gate.update(rms, frame_duration);
+                gate_open.store(should_write, Ordering::Relaxed);
+                if should_write {
+                    ingest_frame(&mono, source_rate, &writer);
+                }
             },
             err_fn,
             None,
@@ -271,11 +385,11 @@ fn build_stream(
     stream.map_err(|e| AudioError::BuildStream(e.to_string()))
 }
 
-/// Met à jour le niveau RMS partagé à partir d'une trame mono fraîchement
-/// downmixée (avant ré-échantillonnage), pour un affichage quasi temps
-/// réel dans le mini-overlay.
-fn update_level(level: &Arc<AtomicU32>, mono: &[f32]) {
-    level.store(compute_rms(mono).to_bits(), Ordering::Relaxed);
+/// Met à jour le niveau RMS partagé à partir d'un niveau déjà calculé pour
+/// la trame courante (évite de recalculer le RMS deux fois : la grille
+/// anti-silence en a elle aussi besoin, voir `build_stream`).
+fn update_level(level: &Arc<AtomicU32>, rms: f32) {
+    level.store(rms.to_bits(), Ordering::Relaxed);
 }
 
 /// Niveau RMS (racine de la moyenne des carrés) d'un buffer de signal.
@@ -356,10 +470,11 @@ mod tests {
             control_tx: Some(control_tx),
             worker: Some(worker),
             level: Arc::new(AtomicU32::new(0)),
+            gate_open: Arc::new(AtomicBool::new(true)),
         };
 
         assert!(capture.is_recording());
-        let result = capture.start(None, PathBuf::from("autre.wav"));
+        let result = capture.start(None, PathBuf::from("autre.wav"), 0.0);
         assert!(matches!(result, Err(AudioError::AlreadyRecording)));
 
         // Nettoyage : on laisse le thread factice se terminer normalement.
@@ -386,5 +501,53 @@ mod tests {
     fn level_defaults_to_zero_and_resets_after_stop() {
         let capture = AudioCapture::new();
         assert_eq!(capture.level(), 0.0);
+    }
+
+    #[test]
+    fn gate_defaults_to_open() {
+        let capture = AudioCapture::new();
+        assert!(capture.is_gate_open());
+    }
+
+    #[test]
+    fn disabled_gate_always_writes() {
+        let mut gate = SilenceGate::new(0.0);
+        assert!(gate.update(0.0, Duration::from_millis(100)));
+        assert!(gate.update(0.0, Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn gate_stays_open_while_above_threshold() {
+        let mut gate = SilenceGate::new(0.1);
+        assert!(gate.update(0.5, Duration::from_millis(20)));
+        assert!(gate.update(0.5, Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn gate_closes_only_after_sustained_silence() {
+        let mut gate = SilenceGate::new(0.1);
+        // Un bref creux sous le seuil (moins que le temps de maintien) ne
+        // doit pas couper le mot en cours.
+        assert!(gate.update(0.5, Duration::from_millis(20)));
+        assert!(gate.update(0.02, Duration::from_millis(100)));
+        assert!(gate.update(0.5, Duration::from_millis(20)));
+
+        // Un silence prolongé (davantage que le temps de maintien, 500 ms)
+        // doit finir par fermer la grille.
+        assert!(gate.update(0.02, Duration::from_millis(300)));
+        assert!(!gate.update(0.02, Duration::from_millis(600)));
+    }
+
+    #[test]
+    fn gate_reopens_immediately_when_level_rises_again() {
+        let mut gate = SilenceGate::new(0.1);
+        // Le silence n'excède pas encore le temps de maintien depuis sa
+        // première détection : la grille reste ouverte.
+        assert!(gate.update(0.02, Duration::from_millis(600)));
+        // Le silence se prolonge désormais au-delà du temps de maintien :
+        // la grille se ferme.
+        assert!(!gate.update(0.02, Duration::from_millis(600)));
+        // Un son franchissant à nouveau le seuil rouvre immédiatement.
+        assert!(gate.update(0.5, Duration::from_millis(10)));
     }
 }

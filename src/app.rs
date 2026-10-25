@@ -39,6 +39,13 @@ type SharedStt = Arc<Mutex<SttState>>;
 type SharedVault = Arc<Mutex<Option<Vault>>>;
 type SharedNoteStatus = Arc<Mutex<NoteStatus>>;
 type SharedSettings = Arc<Mutex<Settings>>;
+/// Erreur survenue en tâche de fond (raccourci clavier global ou menu
+/// System Tray), donc hors de tout clic utilisateur direct : ces threads
+/// n'ont pas accès à l'état de l'interface, mais doivent tout de même
+/// pouvoir signaler un échec plutôt que de le journaliser silencieusement
+/// vers une console invisible (voir `toggle_recording`). Relue et
+/// affichée par `update()` au prochain repaint.
+type SharedBackgroundError = Arc<Mutex<Option<String>>>;
 
 /// État du sous-système de transcription, partagé entre le thread de
 /// chargement du modèle, le thread d'écoute du raccourci global, le thread
@@ -70,6 +77,7 @@ struct AppContext {
     vault: SharedVault,
     note_status: SharedNoteStatus,
     settings: SharedSettings,
+    background_error: SharedBackgroundError,
 }
 
 pub struct ObsidianRecorderApp {
@@ -110,6 +118,7 @@ impl ObsidianRecorderApp {
             vault: Arc::new(Mutex::new(None)),
             note_status: Arc::new(Mutex::new(NoteStatus::Idle)),
             settings: Arc::new(Mutex::new(loaded_settings.clone())),
+            background_error: Arc::new(Mutex::new(None)),
         };
 
         // Le modèle Whisper (des centaines de Mo) se charge en tâche de
@@ -128,7 +137,18 @@ impl ObsidianRecorderApp {
         };
 
         let devices = audio::list_input_devices().unwrap_or_default();
-        let selected_device = devices.first().cloned();
+        // Préfère le périphérique mémorisé lors d'un lancement précédent
+        // s'il est toujours présent ; sinon, retombe sur le premier
+        // disponible. Ce même réglage est relu directement depuis
+        // `ctx.settings` par `toggle_recording`, y compris depuis le
+        // thread du raccourci clavier global et le menu System Tray, pour
+        // qu'ils utilisent toujours le même microphone que celui affiché
+        // ici (voir le correctif documenté dans le README).
+        let selected_device = loaded_settings
+            .input_device
+            .clone()
+            .filter(|d| devices.contains(d))
+            .or_else(|| devices.first().cloned());
 
         // Si un Vault a déjà été choisi lors d'un lancement précédent, on
         // le revalide (il peut avoir été déplacé/supprimé depuis).
@@ -189,6 +209,45 @@ impl ObsidianRecorderApp {
                 }
             }
             Err(err) => self.vault_error = Some(err.to_string()),
+        }
+    }
+
+    /// Ouvre le sélecteur de fichier natif, décode le fichier choisi
+    /// (`.wav`, `.mp3` ou `.m4a`) vers le format canonique de
+    /// l'application et lance sa transcription en différé exactement
+    /// comme pour un enregistrement live fraîchement terminé (même
+    /// pipeline que `toggle_recording`, voir `spawn_transcription`).
+    fn import_audio_file(&mut self) {
+        self.last_error = None;
+        let Some(source) = rfd::FileDialog::new()
+            .set_title("Importer un fichier audio à transcrire")
+            .add_filter("Audio", audio::SUPPORTED_IMPORT_EXTENSIONS)
+            .pick_file()
+        else {
+            return; // L'utilisateur a annulé : on ne change rien.
+        };
+
+        let destination = match default_output_path() {
+            Ok(path) => path,
+            Err(err) => {
+                self.last_error = Some(err.to_string());
+                return;
+            }
+        };
+
+        match audio::decode_to_canonical_wav(&source, &destination) {
+            Ok(duration) => {
+                if let Ok(mut last) = self.ctx.last_recording.lock() {
+                    *last = Some(format!(
+                        "{} ({:.1} s, importé depuis {})",
+                        destination.display(),
+                        duration.as_secs_f64(),
+                        source.display()
+                    ));
+                }
+                spawn_transcription(self.ctx.clone(), destination, duration);
+            }
+            Err(err) => self.last_error = Some(err.to_string()),
         }
     }
 }
@@ -355,7 +414,11 @@ fn section_title(ui: &mut egui::Ui, p: &Palette, text: &str) {
 
 /// Vu-mètre linéaire fin, dessiné directement au peintre (aucun widget
 /// détourné) : piste `card_alt`, remplissage accent proportionnel au niveau.
-fn meter(ui: &mut egui::Ui, p: &Palette, value: f32) {
+/// `threshold`, s'il est fourni et strictement positif, dessine un repère
+/// fin à la position du seuil de captation configuré (même échelle
+/// d'affichage que `value`), pour aider à le régler en observant le
+/// niveau capté en direct.
+fn meter(ui: &mut egui::Ui, p: &Palette, value: f32, threshold: Option<f32>) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 8.0), egui::Sense::hover());
     let painter = ui.painter();
@@ -364,6 +427,15 @@ fn meter(ui: &mut egui::Ui, p: &Palette, value: f32) {
     if filled_width > 0.5 {
         let filled = egui::Rect::from_min_size(rect.min, egui::vec2(filled_width, rect.height()));
         painter.rect_filled(filled, egui::Rounding::same(4.0), p.accent);
+    }
+    if let Some(t) = threshold {
+        if t > 0.0 {
+            let x = rect.min.x + rect.width() * t.clamp(0.0, 1.0);
+            painter.line_segment(
+                [egui::pos2(x, rect.min.y - 1.0), egui::pos2(x, rect.max.y + 1.0)],
+                egui::Stroke::new(1.5, p.danger),
+            );
+        }
     }
 }
 
@@ -394,8 +466,7 @@ impl eframe::App for ObsidianRecorderApp {
         while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
             match event.id.0.as_str() {
                 "toggle_recording" => {
-                    let device = self.selected_device.clone();
-                    if let Err(err) = toggle_recording(&self.ctx, device) {
+                    if let Err(err) = toggle_recording(&self.ctx) {
                         self.last_error = Some(err.to_string());
                     }
                 }
@@ -420,11 +491,21 @@ impl eframe::App for ObsidianRecorderApp {
                         .map(|g| g.is_recording())
                         .unwrap_or(false);
                     if is_recording {
-                        let _ = toggle_recording(&self.ctx, None);
+                        let _ = toggle_recording(&self.ctx);
                     }
                     std::process::exit(0);
                 }
                 _ => {}
+            }
+        }
+
+        // Relaie vers l'affichage une éventuelle erreur survenue en tâche
+        // de fond (raccourci clavier global ou menu System Tray), hors de
+        // tout clic direct dans cette fenêtre (voir `SharedBackgroundError`
+        // et le thread du raccourci dans `setup_global_hotkey`).
+        if let Ok(mut shared) = self.ctx.background_error.lock() {
+            if let Some(message) = shared.take() {
+                self.last_error = Some(message);
             }
         }
 
@@ -436,6 +517,19 @@ impl eframe::App for ObsidianRecorderApp {
             .unwrap_or(false);
         let level = self.ctx.audio.lock().map(|guard| guard.level()).unwrap_or(0.0);
         let display_level = (level * 4.0).clamp(0.0, 1.0);
+        let gate_open = self
+            .ctx
+            .audio
+            .lock()
+            .map(|guard| guard.is_gate_open())
+            .unwrap_or(true);
+        let capture_threshold = self
+            .ctx
+            .settings
+            .lock()
+            .map(|s| s.capture_threshold)
+            .unwrap_or(0.0);
+        let threshold_marker = (capture_threshold * 4.0).clamp(0.0, 1.0);
 
         egui::CentralPanel::default()
             .frame(
@@ -492,6 +586,7 @@ impl eframe::App for ObsidianRecorderApp {
                                 ui.label(
                                     egui::RichText::new("Microphone").size(12.0).color(p.muted),
                                 );
+                                let previous_device = self.selected_device.clone();
                                 egui::ComboBox::from_id_source("device-select")
                                     .selected_text(
                                         self.selected_device.clone().unwrap_or_else(|| {
@@ -508,11 +603,25 @@ impl eframe::App for ObsidianRecorderApp {
                                             );
                                         }
                                     });
+                                // Persiste immédiatement le choix : le
+                                // raccourci clavier global et le menu
+                                // System Tray relisent `ctx.settings`
+                                // (pas l'état de cette fenêtre, voir
+                                // `toggle_recording`) et doivent voir le
+                                // même microphone que celui affiché ici.
+                                if self.selected_device != previous_device {
+                                    if let Ok(mut settings) = self.ctx.settings.lock() {
+                                        settings.input_device = self.selected_device.clone();
+                                        let _ = settings::save(&settings);
+                                    }
+                                }
                             });
 
                             ui.add_space(10.0);
                             ui.horizontal(|ui| {
-                                let (dot, label) = if recording {
+                                let (dot, label) = if recording && !gate_open {
+                                    (p.muted, "En pause (silence détecté)…")
+                                } else if recording {
                                     (p.danger, "Enregistrement en cours…")
                                 } else {
                                     (p.ok, "Prêt")
@@ -523,7 +632,7 @@ impl eframe::App for ObsidianRecorderApp {
 
                             if recording {
                                 ui.add_space(8.0);
-                                meter(ui, &p, display_level);
+                                meter(ui, &p, display_level, Some(threshold_marker));
                             }
 
                             ui.add_space(12.0);
@@ -545,8 +654,7 @@ impl eframe::App for ObsidianRecorderApp {
                                 .clicked()
                             {
                                 self.last_error = None;
-                                let device = self.selected_device.clone();
-                                if let Err(err) = toggle_recording(&self.ctx, device) {
+                                if let Err(err) = toggle_recording(&self.ctx) {
                                     self.last_error = Some(err.to_string());
                                 }
                             }
@@ -626,6 +734,29 @@ impl eframe::App for ObsidianRecorderApp {
                                     );
                                 }
                             }
+
+                            ui.add_space(10.0);
+                            let import_button = egui::Button::new(
+                                egui::RichText::new("Importer un fichier (.wav / .mp3 / .m4a)…")
+                                    .color(p.text),
+                            )
+                            .fill(p.card_alt)
+                            .stroke(egui::Stroke::new(1.0, p.border))
+                            .rounding(egui::Rounding::same(10.0));
+                            if ui
+                                .add_sized([ui.available_width(), 32.0], import_button)
+                                .clicked()
+                            {
+                                self.import_audio_file();
+                            }
+                            ui.label(
+                                egui::RichText::new(
+                                    "Transcription en différé d'un enregistrement existant, \
+                                     sans passer par le microphone.",
+                                )
+                                .size(11.0)
+                                .color(p.muted),
+                            );
                         });
 
                         ui.add_space(12.0);
@@ -860,6 +991,39 @@ impl eframe::App for ObsidianRecorderApp {
 
                                     ui.add_space(10.0);
                                     ui.label(
+                                        egui::RichText::new("Seuil de captation (anti-silence)")
+                                            .size(12.0)
+                                            .color(p.muted),
+                                    );
+                                    let threshold_changed = ui
+                                        .add(
+                                            egui::Slider::new(
+                                                &mut settings.capture_threshold,
+                                                0.0..=0.3,
+                                            )
+                                            .text("seuil")
+                                            .fixed_decimals(3),
+                                        )
+                                        .changed();
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "0 = désactivé (tout est enregistré). Au-delà de 0, \
+                                             l'enregistrement se met en pause automatiquement \
+                                             pendant les silences prolongés (environ 0,5 s), pour \
+                                             ne pas enregistrer les blancs et réduire la taille du \
+                                             fichier audio final. Le repère rouge sur le vu-mètre, \
+                                             pendant un enregistrement, indique le niveau \
+                                             actuellement réglé.",
+                                        )
+                                        .size(11.0)
+                                        .color(p.muted),
+                                    );
+                                    if threshold_changed {
+                                        let _ = settings::save(&settings);
+                                    }
+
+                                    ui.add_space(10.0);
+                                    ui.label(
                                         egui::RichText::new(
                                             "Tags supplémentaires (séparés par des virgules)",
                                         )
@@ -923,16 +1087,21 @@ impl eframe::App for ObsidianRecorderApp {
                         )
                         .show(overlay_ctx, |ui| {
                             ui.horizontal(|ui| {
-                                ui.label(egui::RichText::new("●").size(12.0).color(p.danger));
+                                let (dot, label) = if gate_open {
+                                    (p.danger, "Enregistrement en cours")
+                                } else {
+                                    (p.muted, "En pause (silence)")
+                                };
+                                ui.label(egui::RichText::new("●").size(12.0).color(dot));
                                 ui.label(
-                                    egui::RichText::new("Enregistrement en cours")
+                                    egui::RichText::new(label)
                                         .size(12.0)
                                         .strong()
                                         .color(p.text),
                                 );
                             });
                             ui.add_space(8.0);
-                            meter(ui, &p, display_level);
+                            meter(ui, &p, display_level, Some(threshold_marker));
                         });
                 },
             );
@@ -951,8 +1120,16 @@ fn default_output_path() -> std::io::Result<PathBuf> {
 /// l'arrêt produit un fichier WAV.
 ///
 /// Partagée entre le clic du bouton, le menu System Tray et le raccourci
-/// global (threads différents, voir [`setup_global_hotkey`]).
-fn toggle_recording(ctx: &AppContext, device: Option<String>) -> AudioResult<()> {
+/// global (threads différents, voir [`setup_global_hotkey`]). Lit le
+/// périphérique d'entrée et le seuil de captation directement dans
+/// `ctx.settings` (plutôt que de les recevoir en paramètre) afin que les
+/// trois déclencheurs utilisent toujours exactement le même microphone et
+/// le même réglage anti-silence que ceux affichés dans l'interface —
+/// avant ce correctif, le raccourci clavier ignorait silencieusement le
+/// microphone sélectionné et retombait sur le périphérique par défaut du
+/// système, ce qui pouvait produire un enregistrement vide ou inaudible
+/// si ce périphérique par défaut différait de celui choisi dans l'appli.
+fn toggle_recording(ctx: &AppContext) -> AudioResult<()> {
     let mut capture = ctx
         .audio
         .lock()
@@ -973,8 +1150,13 @@ fn toggle_recording(ctx: &AppContext, device: Option<String>) -> AudioResult<()>
         return Ok(());
     }
 
+    let (device, threshold) = ctx
+        .settings
+        .lock()
+        .map(|s| (s.input_device.clone(), s.capture_threshold))
+        .unwrap_or((None, 0.0));
     let output_path = default_output_path().map_err(|e| AudioError::BuildStream(e.to_string()))?;
-    capture.start(device, output_path)
+    capture.start(device, output_path, threshold)
 }
 
 /// Charge le modèle Whisper en tâche de fond au démarrage de l'application.
@@ -1151,10 +1333,20 @@ fn setup_global_hotkey(ctx: AppContext) -> Result<(), HotkeyError> {
         .spawn(move || loop {
             match global_hotkey::GlobalHotKeyEvent::receiver().recv() {
                 Ok(event) if event.state == global_hotkey::HotKeyState::Released => {
-                    if let Err(err) = toggle_recording(&ctx, None) {
-                        eprintln!(
+                    if let Err(err) = toggle_recording(&ctx) {
+                        let message = format!(
                             "[obsidianrecorder] échec de la bascule d'enregistrement (raccourci) : {err}"
                         );
+                        eprintln!("{message}");
+                        // Ce thread n'a pas accès à l'état de l'interface :
+                        // sans ceci, une erreur ici (ex. microphone occupé)
+                        // n'avait jusqu'ici aucun retour visible pour
+                        // l'utilisateur — l'enregistrement ne démarrait
+                        // tout simplement pas, silencieusement. `update()`
+                        // relit cette file et l'affiche au prochain repaint.
+                        if let Ok(mut shared) = ctx.background_error.lock() {
+                            *shared = Some(err.to_string());
+                        }
                     }
                 }
                 Ok(_) => {}

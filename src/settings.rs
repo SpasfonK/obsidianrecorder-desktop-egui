@@ -41,6 +41,23 @@ pub struct Settings {
     pub extra_tags: Vec<String>,
     #[serde(default)]
     pub theme: ThemePreference,
+    /// Nom du périphérique d'entrée audio choisi par l'utilisateur (voir
+    /// `audio::list_input_devices`). Lu par `toggle_recording` — y compris
+    /// depuis le thread d'écoute du raccourci clavier global, qui n'a pas
+    /// accès à l'état de l'interface — pour que le raccourci et le bouton
+    /// utilisent toujours le même microphone. `None` = périphérique par
+    /// défaut du système.
+    #[serde(default)]
+    pub input_device: Option<String>,
+    /// Seuil de captation (niveau RMS brut, même échelle que
+    /// `AudioCapture::level`) en-dessous duquel l'enregistrement se met en
+    /// pause après un bref maintien, pour ne pas enregistrer les silences
+    /// et réduire la taille du fichier produit (voir
+    /// `audio::capture::SilenceGate`). `0.0` (valeur par défaut) désactive
+    /// totalement la fonction : comportement historique conservé tant que
+    /// l'utilisateur n'a pas réglé le curseur.
+    #[serde(default)]
+    pub capture_threshold: f32,
 }
 
 /// Chemin du fichier de réglages, dans le profil utilisateur courant
@@ -90,6 +107,8 @@ mod tests {
             write_mode: WriteModeSetting::DailyNote,
             extra_tags: vec!["perso".to_string(), "projet-x".to_string()],
             theme: ThemePreference::Light,
+            input_device: Some("Microphone USB".to_string()),
+            capture_threshold: 0.05,
         }
     }
 
@@ -114,6 +133,19 @@ mod tests {
     #[test]
     fn default_theme_is_system() {
         assert_eq!(Settings::default().theme, ThemePreference::System);
+    }
+
+    #[test]
+    fn default_capture_threshold_is_disabled() {
+        // 0.0 doit désactiver la grille anti-silence : comportement
+        // historique conservé tant que l'utilisateur ne règle pas le
+        // curseur (voir audio::capture::SilenceGate).
+        assert_eq!(Settings::default().capture_threshold, 0.0);
+    }
+
+    #[test]
+    fn default_input_device_is_none() {
+        assert_eq!(Settings::default().input_device, None);
     }
 
     #[test]

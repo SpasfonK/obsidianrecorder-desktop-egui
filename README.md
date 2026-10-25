@@ -101,3 +101,55 @@ déjà présent).
   vu-mètre fin dessiné au peintre, et typographie/spacings cohérents. Le
   thème clair/sombre/système des réglages pilote l'ensemble, et l'overlay
   d'enregistrement hérite de la même palette.
+
+## 8. Microphone, seuil anti-silence et import de fichiers
+
+- **Correctif : le raccourci clavier global ignorait le microphone
+  sélectionné.** Avant ce correctif, `toggle_recording` recevait le
+  périphérique en paramètre ; le bouton et le menu System Tray passaient
+  bien le microphone choisi dans l'interface, mais le thread d'écoute du
+  raccourci global (`Ctrl+Shift+O`) passait toujours `None`, c'est-à-dire
+  le périphérique d'entrée **par défaut du système** — et toute erreur de
+  démarrage dans ce thread n'était journalisée que sur la console
+  (invisible pour une application fenêtrée). Résultat possible : un
+  enregistrement démarré au clavier, silencieux ou vide, si le
+  microphone par défaut de Windows différait de celui sélectionné dans
+  l'appli, sans aucun message d'erreur visible. Le microphone choisi est
+  désormais persisté dans `Settings::input_device` et relu directement
+  depuis les réglages partagés par `toggle_recording`, quel que soit
+  l'appelant (bouton, Tray, raccourci) : il n'y a plus de paramètre à
+  oublier de transmettre. Une erreur de démarrage survenue depuis le
+  raccourci est en outre désormais relayée jusqu'à l'interface (bandeau
+  d'erreur de la carte « Enregistrement », via `SharedBackgroundError`).
+  Si le problème persiste malgré ce correctif, vérifiez aussi les
+  réglages de confidentialité Windows (« Autoriser les applications de
+  bureau à accéder au microphone ») : un refus à ce niveau n'est pas
+  détectable par l'application, le flux audio s'ouvre normalement mais
+  ne reçoit que du silence.
+- **Seuil de captation (anti-silence)** : un nouveau curseur, dans la
+  carte « Réglages », règle `Settings::capture_threshold` (niveau RMS
+  brut, 0,0 à 0,3 ; `0` = désactivé, valeur par défaut — aucun changement
+  de comportement pour qui ne touche pas au curseur). Au-delà de `0`,
+  `audio::capture::SilenceGate` met l'enregistrement en pause dès qu'un
+  silence dépasse ~0,5 s (temps de maintien fixe, pour ne jamais couper
+  un mot dont le niveau retombe brièvement entre deux syllabes) et le
+  reprend dès que le niveau repasse au-dessus du seuil — les segments
+  silencieux ne sont tout simplement jamais écrits dans le fichier WAV,
+  ce qui réduit sa taille finale. L'état de la grille (ouverte/en pause)
+  s'affiche en direct à côté du vu-mètre, pendant un enregistrement ; un
+  repère rouge sur le vu-mètre indique le niveau du seuil configuré.
+- **Import d'un fichier audio pour transcription en différé** : un
+  bouton de la carte « Transcription » (`.wav` / `.mp3` / `.m4a`) ouvre un
+  sélecteur de fichier natif, décode le fichier choisi vers le format
+  canonique de l'application (mono 16 kHz) et lance sa transcription
+  exactement comme un enregistrement live fraîchement terminé — y
+  compris l'écriture de la note dans le Vault si celui-ci est configuré.
+  Le `.wav` est lu via `hound` (PCM 16 bits ou flottant 32 bits
+  uniquement ; les autres profondeurs sont rejetées avec un message
+  explicite plutôt qu'un risque de conversion d'échelle incorrecte). Le
+  `.mp3` et le `.m4a` (conteneur MP4 + AAC-LC) sont décodés via
+  `symphonia`, en 100 % Rust pur : aucune dépendance système (pas de
+  ffmpeg/lame à installer), cohérent avec le reste du projet. Limite
+  connue : `symphonia` est épinglé sur la branche `0.5.x` — la `0.6`
+  réorganise l'API des codecs (module `codecs::audio`) et nécessiterait
+  une adaptation du code d'import avant toute montée de version.
