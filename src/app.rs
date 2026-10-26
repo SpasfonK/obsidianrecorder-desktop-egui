@@ -12,10 +12,15 @@ use std::time::Duration;
 
 use eframe::egui;
 
-use obsidianrecorder_lib::audio::{self, AudioCapture, AudioError, AudioPlayback, AudioResult};
+use obsidianrecorder_lib::audio::{
+    self, AudioCapture, AudioError, AudioPlayback, AudioResult, CaptureConfig, RecordingFormat,
+    RecordingSummary,
+};
 use obsidianrecorder_lib::hotkey::{HotkeyAction, HotkeyBinding, HotkeyError, HotkeyRegistry};
 use obsidianrecorder_lib::paths;
-use obsidianrecorder_lib::settings::{self, Settings, ThemePreference, WriteModeSetting};
+use obsidianrecorder_lib::settings::{
+    self, OutputFormatSetting, Settings, ThemePreference, WriteModeSetting,
+};
 use obsidianrecorder_lib::stt::model::{default_model_is_present, default_model_path};
 use obsidianrecorder_lib::stt::Transcriber;
 use obsidianrecorder_lib::vault::{write_note, FrontmatterData, NoteData, Vault, WriteMode};
@@ -213,42 +218,152 @@ impl ObsidianRecorderApp {
     }
 
     /// Ouvre le sélecteur de fichier natif, décode le fichier choisi
-    /// (`.wav`, `.mp3` ou `.m4a`) vers le format canonique de
-    /// l'application et lance sa transcription en différé exactement
-    /// comme pour un enregistrement live fraîchement terminé (même
-    /// pipeline que `toggle_recording`, voir `spawn_transcription`).
+    /// (`.wav`, `.mp3` ou `.m4a`), le ré-encode dans le format de sortie
+    /// configuré (MP3 par défaut, avec la même découpe qu'un enregistrement
+    /// live) puis le transcrit et écrit la note — exactement comme pour un
+    /// enregistrement fraîchement terminé (voir
+    /// [`spawn_transcription_and_note`]).
     fn import_audio_file(&mut self) {
         self.last_error = None;
         let Some(source) = rfd::FileDialog::new()
-            .set_title("Importer un fichier audio à transcrire")
+            .set_title("Importer un fichier audio")
             .add_filter("Audio", audio::SUPPORTED_IMPORT_EXTENSIONS)
             .pick_file()
         else {
             return; // L'utilisateur a annulé : on ne change rien.
         };
 
-        let destination = match default_output_path() {
-            Ok(path) => path,
+        let dir = match default_recordings_dir() {
+            Ok(dir) => dir,
             Err(err) => {
                 self.last_error = Some(err.to_string());
                 return;
             }
         };
 
-        match audio::decode_to_canonical_wav(&source, &destination) {
-            Ok(duration) => {
+        let (format, max_bytes) = self.output_settings();
+
+        match audio::transcode_to_format(
+            &source,
+            &dir,
+            &paths::timestamped_stem(),
+            format,
+            max_bytes,
+        ) {
+            Ok(summary) => {
                 if let Ok(mut last) = self.ctx.last_recording.lock() {
                     *last = Some(format!(
                         "{} ({:.1} s, importé depuis {})",
-                        destination.display(),
-                        duration.as_secs_f64(),
+                        join_paths(&summary.paths),
+                        summary.duration.as_secs_f64(),
                         source.display()
                     ));
                 }
-                spawn_transcription(self.ctx.clone(), destination, duration);
+                spawn_transcription_and_note(self.ctx.clone(), summary);
             }
             Err(err) => self.last_error = Some(err.to_string()),
         }
+    }
+
+    /// Lit le format de sortie et la taille de découpe actuellement réglés.
+    fn output_settings(&self) -> (RecordingFormat, Option<u64>) {
+        self.ctx
+            .settings
+            .lock()
+            .map(|s| {
+                (
+                    format_from_setting(s.output_format),
+                    audio::chunk_bytes_from_mb(s.chunk_size_mb),
+                )
+            })
+            .unwrap_or((RecordingFormat::Mp3, None))
+    }
+
+    /// Contrôles du format de sortie (§2) et de la taille de découpe (§5),
+    /// affichés dans la carte « Enregistrement ».
+    fn output_controls(&mut self, ui: &mut egui::Ui, p: &Palette) {
+        let Ok(mut settings) = self.ctx.settings.lock() else {
+            return;
+        };
+
+        ui.label(
+            egui::RichText::new("Format de sortie")
+                .size(12.0)
+                .color(p.muted),
+        );
+        let mut changed = false;
+        changed |= ui
+            .radio_value(
+                &mut settings.output_format,
+                OutputFormatSetting::Mp3,
+                "MP3 — voix IA, ultra léger (~14 Mo/h)",
+            )
+            .clicked();
+        changed |= ui
+            .radio_value(
+                &mut settings.output_format,
+                OutputFormatSetting::Wav,
+                "WAV — PCM 16 bits non compressé",
+            )
+            .clicked();
+
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new("Découpe automatique (taille max. par fichier)")
+                .size(12.0)
+                .color(p.muted),
+        );
+        ui.horizontal(|ui| {
+            for mb in [10_u32, 25, 50, 0] {
+                let label = if mb == 0 {
+                    "Sans découpe".to_string()
+                } else {
+                    format!("{mb} Mo")
+                };
+                if ui
+                    .selectable_label(settings.chunk_size_mb == mb, label)
+                    .clicked()
+                {
+                    settings.chunk_size_mb = mb;
+                    changed = true;
+                }
+            }
+        });
+        ui.label(
+            egui::RichText::new(
+                "25 Mo correspond à la limite d'upload de l'API Whisper d'OpenAI. Au-delà de la \
+                 taille choisie (moins 64 Ko de marge), un nouveau fichier `…_part2.mp3` est \
+                 ouvert sans perdre une seule trame.",
+            )
+            .size(11.0)
+            .color(p.muted),
+        );
+
+        if changed {
+            let _ = settings::save(&settings);
+        }
+    }
+}
+
+/// Traduit le réglage persisté de format vers le format d'encodage réel.
+fn format_from_setting(setting: OutputFormatSetting) -> RecordingFormat {
+    match setting {
+        OutputFormatSetting::Mp3 => RecordingFormat::Mp3,
+        OutputFormatSetting::Wav => RecordingFormat::Wav,
+    }
+}
+
+/// Concatène des chemins pour un affichage compact (un seul chemin s'il n'y
+/// en a qu'un, sinon « a, b, … (N morceaux) »).
+fn join_paths(paths: &[std::path::PathBuf]) -> String {
+    match paths {
+        [] => "(aucun fichier)".to_string(),
+        [only] => only.display().to_string(),
+        many => format!(
+            "{} (+{} autre(s))",
+            many[0].display(),
+            many.len() - 1
+        ),
     }
 }
 
@@ -560,7 +675,8 @@ impl eframe::App for ObsidianRecorderApp {
                         });
                         ui.label(
                             egui::RichText::new(
-                                "Mémos vocaux locaux · Whisper hors ligne · export Obsidian",
+                                "Mémos vocaux locaux · MP3 voix 16 kHz · Whisper hors ligne · \
+                                 export Obsidian",
                             )
                             .size(12.0)
                             .color(p.muted),
@@ -690,6 +806,9 @@ impl eframe::App for ObsidianRecorderApp {
                                     );
                                 }
                             }
+
+                            ui.add_space(12.0);
+                            self.output_controls(ui, &p);
                         });
 
                         ui.add_space(12.0);
@@ -737,8 +856,10 @@ impl eframe::App for ObsidianRecorderApp {
 
                             ui.add_space(10.0);
                             let import_button = egui::Button::new(
-                                egui::RichText::new("Importer un fichier (.wav / .mp3 / .m4a)…")
-                                    .color(p.text),
+                                egui::RichText::new(
+                                    "Importer et convertir un fichier (.wav / .mp3 / .m4a)…",
+                                )
+                                .color(p.text),
                             )
                             .fill(p.card_alt)
                             .stroke(egui::Stroke::new(1.0, p.border))
@@ -751,8 +872,9 @@ impl eframe::App for ObsidianRecorderApp {
                             }
                             ui.label(
                                 egui::RichText::new(
-                                    "Transcription en différé d'un enregistrement existant, \
-                                     sans passer par le microphone.",
+                                    "Conversion d'un fichier existant vers le format de sortie \
+                                     réglé (avec découpe), puis transcription hors ligne — sans \
+                                     passer par le microphone.",
                                 )
                                 .size(11.0)
                                 .color(p.muted),
@@ -889,10 +1011,9 @@ impl eframe::App for ObsidianRecorderApp {
                                                             .file_stem()
                                                             .and_then(|s| s.to_str())
                                                         {
-                                                            play_request = Some(
-                                                                vault
-                                                                    .resolve(ATTACHMENTS_SUBFOLDER)
-                                                                    .join(format!("{stem}.wav")),
+                                                            play_request = find_attachment(
+                                                                &vault.resolve(ATTACHMENTS_SUBFOLDER),
+                                                                stem,
                                                             );
                                                         }
                                                     }
@@ -1008,10 +1129,11 @@ impl eframe::App for ObsidianRecorderApp {
                                     ui.label(
                                         egui::RichText::new(
                                             "0 = désactivé (tout est enregistré). Au-delà de 0, \
-                                             l'enregistrement se met en pause automatiquement \
-                                             pendant les silences prolongés (environ 0,5 s), pour \
-                                             ne pas enregistrer les blancs et réduire la taille du \
-                                             fichier audio final. Le repère rouge sur le vu-mètre, \
+                                             l'enregistrement se met en pause pendant les silences \
+                                             prolongés, avec un temps de maintien d'environ 1,5 s \
+                                             pour ne pas couper les fins de mots — les blancs ne \
+                                             sont jamais encodés, ce qui réduit la taille du \
+                                             fichier final. Le repère rouge sur le vu-mètre, \
                                              pendant un enregistrement, indique le niveau \
                                              actuellement réglé.",
                                         )
@@ -1109,26 +1231,40 @@ impl eframe::App for ObsidianRecorderApp {
     }
 }
 
-fn default_output_path() -> std::io::Result<PathBuf> {
+/// Dossier où sont déposés les enregistrements (et les imports convertis).
+fn default_recordings_dir() -> std::io::Result<PathBuf> {
     let dir = paths::fallback_recordings_dir();
     std::fs::create_dir_all(&dir)?;
-    Ok(dir.join(paths::timestamped_wav_filename()))
+    Ok(dir)
+}
+
+/// Retrouve le premier fichier audio associé à une note dans `attachments/`.
+/// Selon le format réglé et la découpe, il peut s'appeler `rec_X.mp3`,
+/// `rec_X.wav`, `rec_X_part1.mp3`, etc.
+fn find_attachment(attachments_dir: &Path, stem: &str) -> Option<PathBuf> {
+    [
+        format!("{stem}.mp3"),
+        format!("{stem}.wav"),
+        format!("{stem}_part1.mp3"),
+        format!("{stem}_part1.wav"),
+    ]
+    .iter()
+    .map(|name| attachments_dir.join(name))
+    .find(|path| path.is_file())
 }
 
 /// Bascule l'enregistrement (démarre si arrêté, arrête et finalise sinon).
-/// Déclenche automatiquement une transcription en tâche de fond dès que
-/// l'arrêt produit un fichier WAV.
+/// Déclenche automatiquement transcription et écriture de note en tâche de
+/// fond dès que l'arrêt produit un ou plusieurs fichiers audio.
 ///
 /// Partagée entre le clic du bouton, le menu System Tray et le raccourci
 /// global (threads différents, voir [`setup_global_hotkey`]). Lit le
-/// périphérique d'entrée et le seuil de captation directement dans
-/// `ctx.settings` (plutôt que de les recevoir en paramètre) afin que les
-/// trois déclencheurs utilisent toujours exactement le même microphone et
-/// le même réglage anti-silence que ceux affichés dans l'interface —
-/// avant ce correctif, le raccourci clavier ignorait silencieusement le
-/// microphone sélectionné et retombait sur le périphérique par défaut du
-/// système, ce qui pouvait produire un enregistrement vide ou inaudible
-/// si ce périphérique par défaut différait de celui choisi dans l'appli.
+/// périphérique d'entrée, le seuil de captation, le format et la taille de
+/// découpe directement dans `ctx.settings` (plutôt que de les recevoir en
+/// paramètre) afin que les trois déclencheurs utilisent toujours exactement
+/// les mêmes réglages que ceux affichés dans l'interface — avant ce
+/// correctif, le raccourci clavier ignorait silencieusement le microphone
+/// sélectionné et retombait sur le périphérique par défaut du système.
 fn toggle_recording(ctx: &AppContext) -> AudioResult<()> {
     let mut capture = ctx
         .audio
@@ -1139,24 +1275,39 @@ fn toggle_recording(ctx: &AppContext) -> AudioResult<()> {
         let summary = capture.stop()?;
         let text = format!(
             "{} ({:.1} s)",
-            summary.path.display(),
+            join_paths(&summary.paths),
             summary.duration.as_secs_f64()
         );
         if let Ok(mut last) = ctx.last_recording.lock() {
             *last = Some(text);
         }
         drop(capture);
-        spawn_transcription(ctx.clone(), summary.path, summary.duration);
+        spawn_transcription_and_note(ctx.clone(), summary);
         return Ok(());
     }
 
-    let (device, threshold) = ctx
+    let (device, threshold, format, max_bytes) = ctx
         .settings
         .lock()
-        .map(|s| (s.input_device.clone(), s.capture_threshold))
-        .unwrap_or((None, 0.0));
-    let output_path = default_output_path().map_err(|e| AudioError::BuildStream(e.to_string()))?;
-    capture.start(device, output_path, threshold)
+        .map(|s| {
+            (
+                s.input_device.clone(),
+                s.capture_threshold,
+                format_from_setting(s.output_format),
+                audio::chunk_bytes_from_mb(s.chunk_size_mb),
+            )
+        })
+        .unwrap_or((None, 0.0, RecordingFormat::Mp3, None));
+    let output_dir = default_recordings_dir().map_err(|e| AudioError::BuildStream(e.to_string()))?;
+
+    capture.start(CaptureConfig {
+        device_name: device,
+        output_dir,
+        file_stem: paths::timestamped_stem(),
+        silence_threshold: threshold,
+        format,
+        max_chunk_bytes: max_bytes,
+    })
 }
 
 /// Charge le modèle Whisper en tâche de fond au démarrage de l'application.
@@ -1183,11 +1334,16 @@ fn spawn_model_loader(stt: SharedStt) {
     });
 }
 
-/// Transcrit un enregistrement fraîchement terminé puis, si un Vault est
+/// Transcrit un enregistrement fraîchement terminé (un ou plusieurs
+/// morceaux : voir la découpe dans `audio::encoder`) puis, si un Vault est
 /// configuré, écrit automatiquement la note Markdown correspondante selon
-/// le mode et les tags actuellement réglés. Tout se passe en tâche de
-/// fond, sans bloquer l'interface.
-fn spawn_transcription(ctx: AppContext, wav_path: PathBuf, duration: Duration) {
+/// le mode et les tags actuellement réglés. Tout se passe en tâche de fond,
+/// sans bloquer l'interface.
+///
+/// L'audio peut être du MP3 (format par défaut) ou du WAV : il est décodé
+/// en mémoire vers le format attendu par Whisper (mono 16 kHz) via
+/// [`audio::decode_to_mono_16k`], puis transcrit morceau par morceau.
+fn spawn_transcription_and_note(ctx: AppContext, summary: RecordingSummary) {
     std::thread::spawn(move || {
         let transcriber = {
             let guard = match ctx.stt.lock() {
@@ -1206,19 +1362,42 @@ fn spawn_transcription(ctx: AppContext, wav_path: PathBuf, duration: Duration) {
             *guard = SttState::Transcribing;
         }
 
-        let result = transcriber.transcribe_wav_file(&wav_path);
-        let transcript_text_for_vault = result.as_ref().ok().map(|t| t.full_text());
-
-        if let Ok(mut guard) = ctx.stt.lock() {
-            *guard = match result {
-                Ok(transcript) => SttState::Done(transcript.full_text()),
-                Err(err) => SttState::Failed(err.to_string()),
+        let mut full_text = String::new();
+        let mut failure: Option<String> = None;
+        for path in &summary.paths {
+            let samples = match audio::decode_to_mono_16k(path) {
+                Ok(samples) => samples,
+                Err(err) => {
+                    failure = Some(err.to_string());
+                    break;
+                }
             };
+            match transcriber.transcribe(&samples) {
+                Ok(transcript) => {
+                    let part = transcript.full_text();
+                    if !part.is_empty() {
+                        if !full_text.is_empty() {
+                            full_text.push(' ');
+                        }
+                        full_text.push_str(&part);
+                    }
+                }
+                Err(err) => {
+                    failure = Some(err.to_string());
+                    break;
+                }
+            }
         }
 
-        let Some(transcript_text) = transcript_text_for_vault else {
+        if let Ok(mut guard) = ctx.stt.lock() {
+            *guard = match &failure {
+                Some(err) => SttState::Failed(err.clone()),
+                None => SttState::Done(full_text.clone()),
+            };
+        }
+        if failure.is_some() {
             return;
-        };
+        }
 
         let vault = ctx.vault.lock().ok().and_then(|guard| guard.clone());
         let Some(vault) = vault else {
@@ -1233,9 +1412,9 @@ fn spawn_transcription(ctx: AppContext, wav_path: PathBuf, duration: Duration) {
 
         let outcome = write_note_to_vault(
             &vault,
-            &wav_path,
-            &transcript_text,
-            duration,
+            &summary.paths,
+            &full_text,
+            summary.duration,
             write_mode_setting,
             extra_tags,
         );
@@ -1248,13 +1427,13 @@ fn spawn_transcription(ctx: AppContext, wav_path: PathBuf, duration: Duration) {
     });
 }
 
-/// Copie l'enregistrement dans `attachments/`, construit la note Markdown
-/// (frontmatter + transcription) et l'écrit selon le mode choisi dans les
-/// réglages (nouvelle note dans `AudioNotes/`, ou ajout à la Daily Note du
-/// jour dans `Daily Notes/`).
+/// Copie le(s) fichier(s) audio dans `attachments/`, construit la note
+/// Markdown (frontmatter + transcription + lecture intégrée) et l'écrit
+/// selon le mode choisi dans les réglages (nouvelle note dans
+/// `AudioNotes/`, ou ajout à la Daily Note du jour dans `Daily Notes/`).
 fn write_note_to_vault(
     vault: &Vault,
-    wav_path: &Path,
+    audio_paths: &[PathBuf],
     transcript_text: &str,
     duration: Duration,
     write_mode_setting: WriteModeSetting,
@@ -1263,20 +1442,24 @@ fn write_note_to_vault(
     let attachments_dir = vault.resolve(ATTACHMENTS_SUBFOLDER);
     std::fs::create_dir_all(&attachments_dir).map_err(|e| e.to_string())?;
 
-    let wav_filename = wav_path
-        .file_name()
-        .ok_or_else(|| "nom de fichier audio invalide".to_string())?;
-    let attachment_dest = attachments_dir.join(wav_filename);
-    std::fs::copy(wav_path, &attachment_dest).map_err(|e| e.to_string())?;
-
-    let audio_relative = format!("{ATTACHMENTS_SUBFOLDER}/{}", wav_filename.to_string_lossy());
+    let mut audio_files = Vec::with_capacity(audio_paths.len());
+    for audio_path in audio_paths {
+        let filename = audio_path
+            .file_name()
+            .ok_or_else(|| "nom de fichier audio invalide".to_string())?;
+        std::fs::copy(audio_path, attachments_dir.join(filename)).map_err(|e| e.to_string())?;
+        audio_files.push(format!(
+            "{ATTACHMENTS_SUBFOLDER}/{}",
+            filename.to_string_lossy()
+        ));
+    }
 
     let note_data = NoteData {
         frontmatter: FrontmatterData {
             date: chrono::Local::now(),
             duration,
             extra_tags,
-            audio_file: Some(audio_relative),
+            audio_files,
         },
         transcript_text: transcript_text.to_string(),
     };
@@ -1284,13 +1467,16 @@ fn write_note_to_vault(
     let content = obsidianrecorder_lib::vault::note::render_note(&note_data);
 
     // Le nom de la note reprend l'horodatage de l'enregistrement d'origine
-    // (même racine que le .wav), pour que les deux restent faciles à
-    // rapprocher même en dehors du frontmatter. Ignoré en mode Daily Note
-    // (voir `vault::writer::WriteMode`).
-    let stem = wav_path
-        .file_stem()
+    // (même racine que l'audio), pour que les deux restent faciles à
+    // rapprocher même en dehors du frontmatter. Le suffixe `_part1` d'un
+    // enregistrement découpé est retiré pour un nom de note plus lisible.
+    // Ignoré en mode Daily Note (voir `vault::writer::WriteMode`).
+    let stem = audio_paths
+        .first()
+        .and_then(|path| path.file_stem())
         .and_then(|s| s.to_str())
         .unwrap_or("note");
+    let stem = stem.strip_suffix("_part1").unwrap_or(stem);
     let filename = format!("{stem}.md");
 
     let mode = match write_mode_setting {

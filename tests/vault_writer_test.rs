@@ -28,7 +28,7 @@ fn full_pipeline_renders_valid_markdown_and_writes_it_to_the_vault() {
             date: chrono::Local::now(),
             duration: Duration::from_secs(42),
             extra_tags: vec!["réunion".to_string()],
-            audio_file: Some("attachments/rec_test.wav".to_string()),
+            audio_files: vec!["attachments/rec_test.mp3".to_string()],
         },
         transcript_text: "Ceci est une transcription de test.".to_string(),
     };
@@ -41,7 +41,8 @@ fn full_pipeline_renders_valid_markdown_and_writes_it_to_the_vault() {
     assert!(content.contains("duration: 00:42\n"));
     assert!(content.contains("  - memo-vocal\n"));
     assert!(content.contains("  - réunion\n"));
-    assert!(content.contains("audio_file: \"attachments/rec_test.wav\"\n"));
+    assert!(content.contains("audio_file: \"attachments/rec_test.mp3\"\n"));
+    assert!(content.contains("![[attachments/rec_test.mp3]]\n"));
     assert!(content.contains("Ceci est une transcription de test."));
 
     let target_dir = vault.resolve("AudioNotes");

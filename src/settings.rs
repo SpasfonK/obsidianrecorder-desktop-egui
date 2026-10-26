@@ -31,8 +31,29 @@ pub enum ThemePreference {
     Dark,
 }
 
+/// Format réel du fichier audio produit (voir `audio::encoder`). `Mp3` est
+/// le format par défaut : encodage MP3 réel, 16 kHz mono, CBR 32 kbps —
+/// l'idéal pour la transcription par une IA vocale externe (fichiers très
+/// légers, ~14 Mo/heure). `Wav` reste disponible pour qui préfère du PCM
+/// 16 bits non compressé.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputFormatSetting {
+    #[default]
+    Mp3,
+    Wav,
+}
+
+/// Taille maximale par défaut d'un morceau, en Mo : 25 Mo couvre la limite
+/// d'upload de l'API Whisper d'OpenAI (voir la découpe, `audio::encoder`).
+pub const DEFAULT_CHUNK_SIZE_MB: u32 = 25;
+
+fn default_chunk_size_mb() -> u32 {
+    DEFAULT_CHUNK_SIZE_MB
+}
+
 /// Réglages persistés de l'application.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Settings {
     pub vault_path: Option<PathBuf>,
     #[serde(default)]
@@ -51,13 +72,37 @@ pub struct Settings {
     pub input_device: Option<String>,
     /// Seuil de captation (niveau RMS brut, même échelle que
     /// `AudioCapture::level`) en-dessous duquel l'enregistrement se met en
-    /// pause après un bref maintien, pour ne pas enregistrer les silences
-    /// et réduire la taille du fichier produit (voir
-    /// `audio::capture::SilenceGate`). `0.0` (valeur par défaut) désactive
-    /// totalement la fonction : comportement historique conservé tant que
-    /// l'utilisateur n'a pas réglé le curseur.
+    /// pause après un maintien (voir `audio::capture::SilenceGate`), pour ne
+    /// pas enregistrer les silences et réduire la taille du fichier produit.
+    /// `0.0` (valeur par défaut) désactive totalement la fonction :
+    /// comportement historique conservé tant que l'utilisateur n'a pas réglé
+    /// le curseur.
     #[serde(default)]
     pub capture_threshold: f32,
+    /// Format réel du fichier audio produit (`Mp3` par défaut).
+    #[serde(default)]
+    pub output_format: OutputFormatSetting,
+    /// Taille maximale d'un morceau en Mo, au-delà de laquelle
+    /// l'enregistrement bascule sur un nouveau fichier
+    /// (`..._part2.mp3`, etc.) sans perdre d'audio (voir la découpe dans
+    /// `audio::encoder`). `0` = pas de découpe (fichier unique).
+    #[serde(default = "default_chunk_size_mb")]
+    pub chunk_size_mb: u32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            vault_path: None,
+            write_mode: WriteModeSetting::default(),
+            extra_tags: Vec::new(),
+            theme: ThemePreference::default(),
+            input_device: None,
+            capture_threshold: 0.0,
+            output_format: OutputFormatSetting::default(),
+            chunk_size_mb: DEFAULT_CHUNK_SIZE_MB,
+        }
+    }
 }
 
 /// Chemin du fichier de réglages, dans le profil utilisateur courant
@@ -109,6 +154,8 @@ mod tests {
             theme: ThemePreference::Light,
             input_device: Some("Microphone USB".to_string()),
             capture_threshold: 0.05,
+            output_format: OutputFormatSetting::Wav,
+            chunk_size_mb: 10,
         }
     }
 
@@ -146,6 +193,35 @@ mod tests {
     #[test]
     fn default_input_device_is_none() {
         assert_eq!(Settings::default().input_device, None);
+    }
+
+    #[test]
+    fn default_output_format_is_mp3() {
+        assert_eq!(
+            Settings::default().output_format,
+            OutputFormatSetting::Mp3
+        );
+    }
+
+    #[test]
+    fn default_chunk_size_is_25_mb() {
+        assert_eq!(Settings::default().chunk_size_mb, DEFAULT_CHUNK_SIZE_MB);
+        assert_eq!(DEFAULT_CHUNK_SIZE_MB, 25);
+    }
+
+    #[test]
+    fn missing_chunk_size_falls_back_to_25_mb_not_zero() {
+        // Un ancien fichier de réglages (sans le champ) ne doit PAS hériter
+        // du `Default` de `u32` (0 = pas de découpe) mais bien de 25 Mo.
+        let parsed: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(parsed.chunk_size_mb, DEFAULT_CHUNK_SIZE_MB);
+    }
+
+    #[test]
+    fn explicit_zero_chunk_size_means_no_chunking() {
+        let parsed: Settings =
+            serde_json::from_str(r#"{"chunk_size_mb": 0}"#).unwrap();
+        assert_eq!(parsed.chunk_size_mb, 0);
     }
 
     #[test]

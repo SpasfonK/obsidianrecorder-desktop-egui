@@ -1,5 +1,4 @@
-//! Emplacements par défaut utilisés tant que la sélection du Vault
-//! Obsidian (Itération 3) n'est pas encore implémentée dans l'interface.
+//! Emplacements par défaut et nommage des fichiers audio.
 
 use std::path::{Path, PathBuf};
 
@@ -16,8 +15,9 @@ pub fn portable_dir() -> PathBuf {
 
 /// Dossier de secours où sont déposés les enregistrements :
 /// `Documents\ObsidianRECORDER` dans le profil de l'utilisateur Windows
-/// courant. Sera remplacé par le sous-dossier choisi dans le Vault Obsidian
-/// de l'utilisateur en Itération 3.
+/// courant. Utilisé pour les enregistrements bruts et pour les fichiers
+/// produits par l'import/transcodage, en plus du Vault Obsidian si celui-ci
+/// est configuré.
 pub fn fallback_recordings_dir() -> PathBuf {
     std::env::var_os("USERPROFILE")
         .map(PathBuf::from)
@@ -25,11 +25,12 @@ pub fn fallback_recordings_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Construit un nom de fichier `.wav` horodaté (ex. `rec_20260101_143000.wav`),
-/// en écho au nommage `attachments/rec_YYYYMMDD_HHmmss.wav` prévu par le
-/// frontmatter Markdown des itérations suivantes.
-pub fn timestamped_wav_filename() -> String {
-    format!("rec_{}.wav", chrono::Local::now().format("%Y%m%d_%H%M%S"))
+/// Racine horodatée d'un enregistrement (ex. `rec_20260101_143000`), sans
+/// extension : la même racine est utilisée pour tous les morceaux d'un
+/// enregistrement découpé (`rec_..._part1.mp3`, `rec_..._part2.mp3`, …),
+/// pour que les fichiers d'une même session restent faciles à rapprocher.
+pub fn timestamped_stem() -> String {
+    format!("rec_{}", chrono::Local::now().format("%Y%m%d_%H%M%S"))
 }
 
 #[cfg(test)]
@@ -51,5 +52,22 @@ mod tests {
         let exe = std::env::current_exe().expect("current_exe() doit être disponible en test");
         let parent = exe.parent().expect("l'exécutable doit avoir un dossier parent");
         assert_eq!(portable_dir(), parent.to_path_buf());
+    }
+
+    #[test]
+    fn timestamped_stem_has_the_expected_shape() {
+        let stem = timestamped_stem();
+        assert!(stem.starts_with("rec_"), "préfixe inattendu : {stem}");
+        // `rec_` + `YYYYMMDD_HHMMSS` = 4 + 15 caractères.
+        assert_eq!(stem.len(), 19, "longueur inattendue : {stem}");
+        let digits = stem.trim_start_matches("rec_");
+        let parts: Vec<&str> = digits.split('_').collect();
+        assert_eq!(parts.len(), 2, "séparateur `_` manquant : {stem}");
+        assert_eq!(parts[0].len(), 8, "date inattendue : {stem}");
+        assert_eq!(parts[1].len(), 6, "heure inattendue : {stem}");
+        assert!(
+            digits.chars().all(|c| c.is_ascii_digit() || c == '_'),
+            "caractères inattendus : {stem}"
+        );
     }
 }

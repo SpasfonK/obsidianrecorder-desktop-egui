@@ -2,7 +2,7 @@
 name = "obsidianrecorder-desktop"
 version = "0.7.0"
 edition = "2021"
-description = "ObsidianRECORDER Desktop – enregistreur de mémos vocaux local, sans dépendance externe : capture audio, raccourci clavier global, STT hors ligne (Whisper), export Markdown vers un Vault Obsidian, dashboard avec lecture audio, icône System Tray, mini-overlay vu-mètre live, interface native egui"
+description = "ObsidianRECORDER Desktop – enregistreur de mémos vocaux local, sans dépendance externe : capture audio encodée en vrai MP3 (16 kHz mono, optimisé pour la transcription par IA externe), VAD anti-silence, découpe automatique en plusieurs fichiers, raccourci clavier global, export Markdown vers un Vault Obsidian, dashboard avec lecture audio, icône System Tray, mini-overlay vu-mètre live, interface native egui"
 authors = ["SpasfonK"]
 license = "MIT"
 rust-version = "1.77"
@@ -35,7 +35,7 @@ global-hotkey = "0.7"
 # et lié STATIQUEMENT dans le binaire (aucun .dll séparé à distribuer). Le
 # modèle GGML, lui, reste un fichier externe téléchargé une fois — voir
 # src/stt/model.rs et scripts/download-model.ps1. Nécessite un compilateur
-# C++, CMake et libclang (bindgen) au moment de la COMPILATION uniquement ;
+# C++ et libclang (bindgen) au moment de la COMPILATION uniquement ;
 # voir le CI et le README, section « Limites connues », pour le détail.
 whisper-rs = "0.16"
 
@@ -62,12 +62,20 @@ serde_json = "1"
 # la même façon (voir app.rs::setup_tray_icon).
 tray-icon = "0.20"
 
-# Décodage de fichiers audio externes pour l'import en transcription
-# différée (voir audio::import) : MP3 et M4A/AAC, en 100 % Rust pur — aucune
-# dépendance système (pas de ffmpeg/lame à installer), cohérent avec le
-# reste du projet. Le WAV, lui, reste géré par `hound` (déjà présent).
-# Épinglé sur la branche 0.5 : la 0.6 réorganise l'API des codecs
-# (voir README, section « Limites connues »).
+# Encodage MP3 réel à la volée (voir audio::encoder) : liaisons Rust vers
+# libmp3lame (LAME), compilée et liée statiquement dans le binaire — aucune
+# dépendance système à installer, aucun exécutable externe. Produit de vraies
+# trames MP3 avec en-têtes valides (jamais un WAV renommé), en CBR, au débit
+# adapté à la voix. Le WAV (PCM 16 bits) reste proposé en option via `hound`.
+#
+# Licence : LAME est sous LGPL-3.0 (voir README, section « Limites connues »).
+mp3lame-encoder = "0.2"
+
+# Décodage de fichiers audio externes (import/transcodage en MP3, voir
+# audio::import) et lecture des enregistrements MP3 dans le dashboard (voir
+# audio::playback) : MP3 et M4A/AAC, en 100 % Rust pur. Le WAV, lui, reste
+# géré par `hound` (déjà présent). Épinglé sur la branche 0.5 : la 0.6
+# réorganise l'API des codecs (voir README, section « Limites connues »).
 symphonia = { version = "0.5.4", default-features = false, features = ["mp3", "isomp4", "aac"] }
 
 # Empreinte disque/mémoire minimale (cahier des charges, section 2).

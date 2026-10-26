@@ -1,48 +1,65 @@
-//! Import de fichiers audio externes (`.wav`, `.mp3`, `.m4a`) pour une
-//! transcription en différé : décodage vers un signal mono flottant,
-//! conversion vers le format canonique de l'application (mono 16 kHz, via
-//! le même pipeline DSP que la capture live — voir `super::dsp`), puis
-//! écriture d'un fichier `.wav` standard directement réutilisable par
-//! `spawn_transcription` et par l'écriture dans le Vault, exactement
-//! comme un enregistrement live.
+//! Décodage de fichiers audio externes (`.wav`, `.mp3`, `.m4a`) et
+//! transcodage vers le format de sortie configuré (MP3 ou WAV), pour
+//! importer un enregistrement existant dans le dossier de travail — avec la
+//! même découpe automatique qu'un enregistrement live (voir
+//! [`ChunkedRecorder`]).
+//!
+//! Ce module sert aussi de brique de décodage à [`super::playback`] : la
+//! fonction [`decode_to_mono`] sait lire aussi bien un WAV qu'un MP3 ou un
+//! M4A.
 //!
 //! Le WAV est lu via `hound` (déjà une dépendance du projet). Le MP3 et le
 //! M4A/AAC sont décodés via `symphonia`, en 100 % Rust pur : aucune
-//! dépendance système (pas de ffmpeg/lame à installer), cohérent avec le
-//! reste du projet.
+//! dépendance système (pas de ffmpeg/lame à installer).
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use super::dsp::{downmix_f32_to_mono, quantize_to_i16, resample_linear, TARGET_SAMPLE_RATE};
+use super::encoder::{ChunkedRecorder, RecordingFormat, RecordingSummary};
 use super::error::{AudioError, AudioResult};
-use super::wav_writer::RecordingWavWriter;
 
-/// Extensions de fichiers acceptées par le sélecteur natif lors de
-/// l'import (en minuscules, sans le point).
+/// Extensions de fichiers acceptées par le sélecteur natif lors de l'import
+/// (en minuscules, sans le point).
 pub const SUPPORTED_IMPORT_EXTENSIONS: &[&str] = &["wav", "mp3", "m4a"];
 
 /// Décode `source_path` (`.wav`, `.mp3` ou `.m4a`), le convertit vers le
-/// format canonique mono 16 kHz PCM 16 bits et l'écrit dans
-/// `destination_path`. Retourne la durée du fichier produit, pour un
-/// affichage immédiat avant la fin de la transcription.
-pub fn decode_to_canonical_wav(
+/// format canonique mono 16 kHz PCM 16 bits, puis l'encode dans `format`
+/// (MP3 ou WAV) au sein de `output_dir`, sous la racine `file_stem`, avec
+/// la même découpe que la capture live si `max_bytes` est fourni.
+pub fn transcode_to_format(
     source_path: &Path,
-    destination_path: &Path,
-) -> AudioResult<std::time::Duration> {
+    output_dir: &Path,
+    file_stem: &str,
+    format: RecordingFormat,
+    max_bytes: Option<u64>,
+) -> AudioResult<RecordingSummary> {
     let (mono, source_rate) = decode_to_mono(source_path)?;
     let resampled = resample_linear(&mono, source_rate, TARGET_SAMPLE_RATE);
     let pcm16 = quantize_to_i16(&resampled);
 
-    let mut writer = RecordingWavWriter::create(destination_path)?;
-    writer.write_samples(&pcm16)?;
-    let duration = writer.duration();
-    writer.finalize()?;
-    Ok(duration)
+    let mut recorder = ChunkedRecorder::create(output_dir, file_stem, format, max_bytes)?;
+    recorder.write_pcm(&pcm16)?;
+    recorder.finalize()
+}
+
+/// Décode n'importe quel fichier pris en charge (`.wav`, `.mp3`, `.m4a`)
+/// vers un signal mono 16 kHz flottant — exactement le format attendu par
+/// le moteur de reconnaissance vocale ([`crate::stt::Transcriber`]).
+///
+/// Utilisé par l'écriture des notes : comme l'enregistrement peut être un
+/// MP3 (format par défaut) ou un WAV, la transcription locale doit pouvoir
+/// lire les deux.
+pub fn decode_to_mono_16k(source_path: &Path) -> AudioResult<Vec<f32>> {
+    let (mono, source_rate) = decode_to_mono(source_path)?;
+    Ok(resample_linear(&mono, source_rate, TARGET_SAMPLE_RATE))
 }
 
 /// Décode `source_path` vers un signal mono flottant [-1.0, 1.0], à sa
 /// fréquence d'échantillonnage native (pas encore ré-échantillonné).
-fn decode_to_mono(source_path: &Path) -> AudioResult<(Vec<f32>, u32)> {
+///
+/// `pub(crate)` : également utilisé par la lecture audio du dashboard (voir
+/// `super::playback`), qui doit pouvoir relire aussi bien un MP3 qu'un WAV.
+pub(crate) fn decode_to_mono(source_path: &Path) -> AudioResult<(Vec<f32>, u32)> {
     let extension = source_path
         .extension()
         .and_then(|e| e.to_str())
@@ -58,13 +75,11 @@ fn decode_to_mono(source_path: &Path) -> AudioResult<(Vec<f32>, u32)> {
     }
 }
 
-/// Décode un fichier `.wav` quelconque (pas nécessairement produit par
-/// cette application) vers un signal mono flottant. Seuls le PCM 16 bits
-/// signé et le flottant 32 bits sont pris en charge : ce sont de loin les
-/// deux formats WAV les plus répandus, et les deux déjà manipulés ailleurs
-/// dans ce projet (voir `stt::transcriber` et `audio::playback`). Les
-/// autres profondeurs (8/24/32 bits entiers) sont rejetées avec un message
-/// clair plutôt que risquer une conversion d'échelle incorrecte.
+/// Décode un fichier `.wav` quelconque vers un signal mono flottant. Seuls
+/// le PCM 16 bits signé et le flottant 32 bits sont pris en charge : les
+/// deux formats WAV les plus répandus. Les autres profondeurs (8/24/32 bits
+/// entiers) sont rejetées avec un message clair plutôt que risquer une
+/// conversion d'échelle incorrecte.
 fn decode_wav(source_path: &Path) -> AudioResult<(Vec<f32>, u32)> {
     let to_read_err = |source: hound::Error| AudioError::WavRead {
         path: source_path.to_path_buf(),
@@ -261,19 +276,54 @@ mod tests {
     }
 
     #[test]
-    fn decode_to_canonical_wav_produces_a_readable_mono_16k_file() {
+    fn transcode_produces_a_mono_16k_mp3_with_valid_frames() {
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("source.wav");
-        write_test_wav(&source, 48_000, 1, &[0; 4_800]); // 0,1 s de silence à 48 kHz
+        // 0,5 s de signal à 48 kHz stéréo.
+        let mut samples = Vec::new();
+        for i in 0..24_000 {
+            let v = if i % 2 == 0 { 6_000 } else { -6_000 };
+            samples.push(v);
+            samples.push(v);
+        }
+        write_test_wav(&source, 48_000, 2, &samples);
 
-        let destination = tmp.path().join("converti.wav");
-        let duration = decode_to_canonical_wav(&source, &destination).unwrap();
+        let summary = transcode_to_format(
+            &source,
+            tmp.path(),
+            "import_test",
+            RecordingFormat::Mp3,
+            None,
+        )
+        .unwrap();
 
-        assert!(destination.is_file());
-        let reader = hound::WavReader::open(&destination).unwrap();
-        let spec = reader.spec();
-        assert_eq!(spec.channels, 1);
-        assert_eq!(spec.sample_rate, TARGET_SAMPLE_RATE);
-        assert!(duration.as_secs_f64() > 0.0);
+        assert_eq!(summary.paths.len(), 1);
+        assert_eq!(summary.paths[0].extension().unwrap(), "mp3");
+        let bytes = std::fs::read(&summary.paths[0]).unwrap();
+        assert_eq!(bytes[0], 0xFF, "mot de synchronisation MP3 absent");
+        assert_eq!(bytes[1] & 0xE0, 0xE0, "mot de synchronisation MP3 invalide");
+        assert!(summary.duration.as_secs_f64() > 0.4);
+    }
+
+    #[test]
+    fn transcode_can_output_wav_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.wav");
+        write_test_wav(&source, 48_000, 1, &[0; 4_800]);
+
+        let summary = transcode_to_format(
+            &source,
+            tmp.path(),
+            "import_wav",
+            RecordingFormat::Wav,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(summary.paths[0].extension().unwrap(), "wav");
+        let reader = hound::WavReader::open(&summary.paths[0]).unwrap();
+        assert_eq!(reader.spec().channels, 1);
+        assert_eq!(reader.spec().sample_rate, TARGET_SAMPLE_RATE);
+        assert!(summary.duration.as_secs_f64() > 0.0);
     }
 }

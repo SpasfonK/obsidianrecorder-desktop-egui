@@ -52,6 +52,19 @@ pub enum AudioError {
 
     #[error("impossible de décoder le fichier audio importé : {0}")]
     Decode(String),
+
+    #[error("erreur d'accès au fichier « {path} » : {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("impossible d'initialiser l'encodeur MP3 : {0}")]
+    Mp3Init(String),
+
+    #[error("erreur d'encodage MP3 : {0}")]
+    Mp3Encode(String),
 }
 
 pub type AudioResult<T> = Result<T, AudioError>;

@@ -1,6 +1,6 @@
-//! Lecture audio d'aperçu : lit un fichier `.wav` mono 16 kHz (le format
-//! produit par `audio::wav_writer`) via le périphérique de sortie par
-//! défaut.
+//! Lecture audio d'aperçu : lit un enregistrement (`.wav` ou `.mp3`, via
+//! [`super::import::decode_to_mono`]) et le restitue sur le périphérique de
+//! sortie par défaut.
 //!
 //! Même contrainte que `audio::capture` : `cpal::Stream` n'implémente pas
 //! `Send` sous Windows (WASAPI/COM) — même solution, un thread dédié qui
@@ -9,9 +9,6 @@
 //! ré-échantillonne vers la fréquence native du périphérique de sortie,
 //! puis on dépose chaque échantillon mono sur tous les canaux de sortie
 //! (upmix simple, suffisant pour une prévisualisation).
-//!
-//! Hypothèse volontaire : le fichier source est mono (toujours vrai pour
-//! les fichiers produits par cette application elle-même).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,6 +20,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 
 use super::dsp::resample_linear;
 use super::error::{AudioError, AudioResult};
+use super::import::decode_to_mono;
 
 enum PlaybackCommand {
     Stop,
@@ -46,20 +44,21 @@ impl AudioPlayback {
         self.worker.is_some()
     }
 
-    /// Démarre la lecture de `wav_path`. Bloque brièvement le temps que le
-    /// thread dédié confirme que le flux audio a bien démarré.
-    pub fn play(&mut self, wav_path: impl AsRef<Path>) -> AudioResult<()> {
+    /// Démarre la lecture de `audio_path` (`.wav`, `.mp3` ou `.m4a`).
+    /// Bloque brièvement le temps que le thread dédié confirme que le flux
+    /// audio a bien démarré.
+    pub fn play(&mut self, audio_path: impl AsRef<Path>) -> AudioResult<()> {
         if self.worker.is_some() {
             return Err(AudioError::AlreadyPlaying);
         }
 
-        let wav_path = wav_path.as_ref().to_path_buf();
+        let audio_path = audio_path.as_ref().to_path_buf();
         let (control_tx, control_rx) = mpsc::channel::<PlaybackCommand>();
         let (ready_tx, ready_rx) = mpsc::channel::<AudioResult<()>>();
 
         let worker = thread::Builder::new()
             .name("obsidianrecorder-audio-playback".into())
-            .spawn(move || run_playback_thread(wav_path, control_rx, ready_tx))
+            .spawn(move || run_playback_thread(audio_path, control_rx, ready_tx))
             .map_err(|e| AudioError::BuildStream(e.to_string()))?;
 
         match ready_rx.recv() {
@@ -117,11 +116,11 @@ impl Default for AudioPlayback {
 }
 
 fn run_playback_thread(
-    wav_path: PathBuf,
+    audio_path: PathBuf,
     control_rx: mpsc::Receiver<PlaybackCommand>,
     ready_tx: mpsc::Sender<AudioResult<()>>,
 ) -> AudioResult<()> {
-    let setup = setup_playback_stream(&wav_path);
+    let setup = setup_playback_stream(&audio_path);
     let (stream, finished_rx) = match setup {
         Ok(pair) => {
             let _ = ready_tx.send(Ok(()));
@@ -153,21 +152,10 @@ fn run_playback_thread(
 }
 
 fn setup_playback_stream(
-    wav_path: &Path,
+    audio_path: &Path,
 ) -> AudioResult<(cpal::Stream, mpsc::Receiver<()>)> {
-    let mut reader = hound::WavReader::open(wav_path).map_err(|source| AudioError::WavRead {
-        path: wav_path.to_path_buf(),
-        source,
-    })?;
-    let source_rate = reader.spec().sample_rate;
-    let source_mono: Vec<f32> = reader
-        .samples::<i16>()
-        .map(|s| s.map(|v| v as f32 / i16::MAX as f32))
-        .collect::<Result<_, _>>()
-        .map_err(|source| AudioError::WavRead {
-            path: wav_path.to_path_buf(),
-            source,
-        })?;
+    // Décode aussi bien le WAV que le MP3/M4A (voir `super::import`).
+    let (source_mono, source_rate) = decode_to_mono(audio_path)?;
 
     let host = cpal::default_host();
     let device = host.default_output_device().ok_or(AudioError::NoOutputDevice)?;
@@ -346,7 +334,7 @@ mod tests {
         };
 
         assert!(playback.is_playing());
-        let result = playback.play("quelconque.wav");
+        let result = playback.play("quelconque.mp3");
         assert!(matches!(result, Err(AudioError::AlreadyPlaying)));
 
         let _ = playback.stop();

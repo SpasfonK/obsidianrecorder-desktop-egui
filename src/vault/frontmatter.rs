@@ -14,9 +14,10 @@ pub struct FrontmatterData {
     /// l'utilisateur (la déduction automatique de tags est hors périmètre
     /// de cette itération). `memo-vocal` est toujours ajouté en premier.
     pub extra_tags: Vec<String>,
-    /// Chemin relatif au Vault du fichier audio associé, s'il a été copié
-    /// dans le Vault (ex. "attachments/rec_20260101_120000.wav").
-    pub audio_file: Option<String>,
+    /// Chemins relatifs au Vault des fichiers audio associés, s'ils ont été
+    /// copiés dans le Vault (ex. "attachments/rec_20260101_120000.mp3").
+    /// Un enregistrement découpé en produit plusieurs.
+    pub audio_files: Vec<String>,
 }
 
 /// Génère le bloc frontmatter YAML (bornes `---` incluses).
@@ -32,8 +33,21 @@ pub fn render_frontmatter(data: &FrontmatterData) -> String {
             out.push_str(&format!("  - {sanitized}\n"));
         }
     }
-    if let Some(audio) = &data.audio_file {
-        out.push_str(&format!("audio_file: \"{}\"\n", escape_yaml_string(audio)));
+    match data.audio_files.as_slice() {
+        [] => {}
+        // Un seul fichier : on garde la clé scalaire historique
+        // `audio_file` (compatibilité avec les notes déjà produites et les
+        // outils qui la lisent).
+        [only] => {
+            out.push_str(&format!("audio_file: \"{}\"\n", escape_yaml_string(only)));
+        }
+        // Enregistrement découpé : une liste YAML.
+        many => {
+            out.push_str("audio_files:\n");
+            for audio in many {
+                out.push_str(&format!("  - \"{}\"\n", escape_yaml_string(audio)));
+            }
+        }
     }
     out.push_str("---\n");
     out
@@ -81,7 +95,7 @@ mod tests {
             date: sample_date(),
             duration: Duration::from_secs(95),
             extra_tags: vec![],
-            audio_file: None,
+            audio_files: vec![],
         };
         let rendered = render_frontmatter(&data);
         assert_eq!(
@@ -97,18 +111,36 @@ mod tests {
     }
 
     #[test]
-    fn includes_extra_tags_and_audio_file() {
+    fn includes_extra_tags_and_a_single_audio_file_as_scalar() {
         let data = FrontmatterData {
             date: sample_date(),
             duration: Duration::from_secs(5),
             extra_tags: vec!["réunion".to_string(), "projet x".to_string()],
-            audio_file: Some("attachments/rec_20260115_143005.wav".to_string()),
+            audio_files: vec!["attachments/rec_20260115_143005.mp3".to_string()],
         };
         let rendered = render_frontmatter(&data);
         assert!(rendered.contains("  - memo-vocal\n"));
         assert!(rendered.contains("  - réunion\n"));
         assert!(rendered.contains("  - projet-x\n"));
-        assert!(rendered.contains("audio_file: \"attachments/rec_20260115_143005.wav\"\n"));
+        assert!(rendered.contains("audio_file: \"attachments/rec_20260115_143005.mp3\"\n"));
+    }
+
+    #[test]
+    fn renders_a_chunked_recording_as_a_yaml_list() {
+        let data = FrontmatterData {
+            date: sample_date(),
+            duration: Duration::from_secs(5),
+            extra_tags: vec![],
+            audio_files: vec![
+                "attachments/rec_x_part1.mp3".to_string(),
+                "attachments/rec_x_part2.mp3".to_string(),
+            ],
+        };
+        let rendered = render_frontmatter(&data);
+        assert!(rendered.contains("audio_files:\n"));
+        assert!(rendered.contains("  - \"attachments/rec_x_part1.mp3\"\n"));
+        assert!(rendered.contains("  - \"attachments/rec_x_part2.mp3\"\n"));
+        assert!(!rendered.contains("audio_file: "));
     }
 
     #[test]

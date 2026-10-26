@@ -1,10 +1,13 @@
 # ObsidianRECORDER Desktop
 
-Distribution **portable** (le modèle Whisper vit à côté de l'exécutable) et
-**interface retravaillée** (sobre, un seul accent, cartes arrondies). Le
-reste — socle audio, raccourci global, STT Whisper hors ligne, export
-Obsidian, réglages, System Tray, dashboard + lecture, mini-overlay vu-mètre —
-reste inchangé (voir les sections précédentes pour leur détail).
+Distribution **portable** (le modèle Whisper vit à côté de l'exécutable),
+**interface retravaillée** (sobre, un seul accent, cartes arrondies) et
+**moteur d'enregistrement optimisé pour la transcription par IA** : encodage
+**MP3 réel** (16 kHz mono, CBR 32 kbps), VAD anti-silence avec maintien de
+1,5 s, et **découpe automatique** en plusieurs fichiers. La transcription
+locale (Whisper hors ligne), l'export Obsidian, le raccourci global, les
+réglages, le System Tray, le dashboard + lecture et le mini-overlay vu-mètre
+sont conservés.
 
 ## 1. Ce qui est livré
 
@@ -75,8 +78,10 @@ cargo build --release
 cargo test --all
 ```
 
-Aucune nouvelle dépendance Cargo (le multi-viewport fait partie d'`egui`,
-déjà présent).
+Une dépendance a été ajoutée pour l'encodage MP3 réel : `mp3lame-encoder`
+(liaisons Rust vers LAME, compilée et liée statiquement — aucun `.dll` ni
+exécutable externe à distribuer). Elle est sous licence **LGPL-3.0** (LAME),
+voir la section 9 et la note de licence.
 
 ## 7. Distribution portable et identité visuelle
 
@@ -126,30 +131,56 @@ déjà présent).
   bureau à accéder au microphone ») : un refus à ce niveau n'est pas
   détectable par l'application, le flux audio s'ouvre normalement mais
   ne reçoit que du silence.
-- **Seuil de captation (anti-silence)** : un nouveau curseur, dans la
+- **Seuil de captation (anti-silence / VAD)** : un curseur, dans la
   carte « Réglages », règle `Settings::capture_threshold` (niveau RMS
   brut, 0,0 à 0,3 ; `0` = désactivé, valeur par défaut — aucun changement
   de comportement pour qui ne touche pas au curseur). Au-delà de `0`,
   `audio::capture::SilenceGate` met l'enregistrement en pause dès qu'un
-  silence dépasse ~0,5 s (temps de maintien fixe, pour ne jamais couper
-  un mot dont le niveau retombe brièvement entre deux syllabes) et le
-  reprend dès que le niveau repasse au-dessus du seuil — les segments
-  silencieux ne sont tout simplement jamais écrits dans le fichier WAV,
-  ce qui réduit sa taille finale. L'état de la grille (ouverte/en pause)
-  s'affiche en direct à côté du vu-mètre, pendant un enregistrement ; un
-  repère rouge sur le vu-mètre indique le niveau du seuil configuré.
-- **Import d'un fichier audio pour transcription en différé** : un
-  bouton de la carte « Transcription » (`.wav` / `.mp3` / `.m4a`) ouvre un
-  sélecteur de fichier natif, décode le fichier choisi vers le format
-  canonique de l'application (mono 16 kHz) et lance sa transcription
-  exactement comme un enregistrement live fraîchement terminé — y
-  compris l'écriture de la note dans le Vault si celui-ci est configuré.
-  Le `.wav` est lu via `hound` (PCM 16 bits ou flottant 32 bits
-  uniquement ; les autres profondeurs sont rejetées avec un message
+  silence dépasse le **temps de maintien de 1,5 s** (pour ne jamais couper
+  un mot dont le niveau retombe brièvement entre deux syllabes, ni une
+  courte respiration) et le reprend dès que le niveau repasse au-dessus du
+  seuil — les segments silencieux ne sont **jamais envoyés à l'encodeur**,
+  ce qui réduit la taille finale du fichier. L'état de la grille
+  (ouverte/en pause) s'affiche en direct à côté du vu-mètre ; un repère
+  rouge sur le vu-mètre indique le niveau du seuil configuré.
+- **Import / conversion d'un fichier audio** : un bouton de la carte
+  « Transcription » (`.wav` / `.mp3` / `.m4a`) ouvre un sélecteur de fichier
+  natif, décode le fichier choisi, le **ré-encode dans le format de sortie
+  réglé** (MP3 par défaut, avec la même découpe qu'un enregistrement live)
+  puis le transcrit et écrit la note — exactement comme un enregistrement
+  fraîchement terminé. Le `.wav` est lu via `hound` (PCM 16 bits ou flottant
+  32 bits uniquement ; les autres profondeurs sont rejetées avec un message
   explicite plutôt qu'un risque de conversion d'échelle incorrecte). Le
   `.mp3` et le `.m4a` (conteneur MP4 + AAC-LC) sont décodés via
-  `symphonia`, en 100 % Rust pur : aucune dépendance système (pas de
-  ffmpeg/lame à installer), cohérent avec le reste du projet. Limite
+  `symphonia`, en 100 % Rust pur : aucune dépendance système. Limite
   connue : `symphonia` est épinglé sur la branche `0.5.x` — la `0.6`
   réorganise l'API des codecs (module `codecs::audio`) et nécessiterait
-  une adaptation du code d'import avant toute montée de version.
+  une adaptation avant toute montée de version.
+
+## 9. Moteur d'enregistrement « voix IA » : MP3 réel, format et découpe
+
+- **MP3 réel à la volée** (`audio::encoder`, via `mp3lame-encoder`) : les
+  échantillons PCM sont encodés par LAME en **vraies trames MP3** avec
+  en-têtes valides — jamais un WAV renommé en `.mp3`. Paramètres fixés
+  pour la voix et les modèles de transcription : **16 kHz, mono, PCM
+  16 bits en entrée, CBR 32 kbps** en sortie (~14 Mo par heure). Le tag
+  VBR/Info est volontairement désactivé (CBR pur) : la sortie se réduit à
+  des trames brutes, ce qui rend chaque morceau d'une découpe autonome.
+- **Choix du format de sortie** : « MP3 — voix IA » (par défaut) ou
+  « WAV — PCM 16 bits », dans la carte « Enregistrement »
+  (`Settings::output_format`). Le downmix stéréo → mono est fait avant
+  l'encodage dans tous les cas.
+- **Découpe automatique (§5)** : `ChunkedRecorder` surveille le nombre
+  d'octets écrits et, dès que le fichier courant atteint la taille choisie
+  **moins 64 Ko de marge**, vide l'encodeur (`flush`), ferme le fichier et
+  ouvre immédiatement le suivant (`rec_…_part2.mp3`, …) — sans perdre une
+  seule trame. Tailles proposées : 10 Mo, 25 Mo (défaut, limite de l'API
+  Whisper d'OpenAI), 50 Mo, ou « sans découpe ».
+- **Note Obsidian** : chaque note référence son (ses) fichier(s) audio
+  (`audio_file` si un seul, `audio_files` en liste YAML si découpé) et les
+  intègre en lecture directe (`![[attachments/…]]`). La lecture du
+  dashboard relit aussi bien le MP3 que le WAV.
+- **Licence** : LAME (donc `mp3lame-encoder`) est sous **LGPL-3.0**. Le
+  binaire la lie statiquement ; toute redistribution doit rester conforme
+  à la LGPL (fourniture du code source de la bibliothèque et possibilité de
+  la remplacer). Le reste du projet reste MIT.
