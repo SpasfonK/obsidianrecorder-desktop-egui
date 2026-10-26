@@ -191,7 +191,7 @@ impl Mp3Sink {
     /// reste puis ferme le fichier. Indispensable pour que le dernier
     /// morceau soit un MP3 complet et lisible.
     fn finalize(mut self) -> AudioResult<PathBuf> {
-        use mp3lame_encoder::{EncoderFlush, FlushNoGap};
+        use mp3lame_encoder::FlushNoGap;
 
         // LAME documente qu'un flush final peut écrire jusqu'à 7200 octets :
         // on réserve large (16 Ko) pour ne jamais tronquer la dernière trame.
@@ -307,19 +307,26 @@ impl ChunkedRecorder {
 
     /// Écrit une trame PCM (16 kHz mono) et bascule sur le morceau suivant
     /// si la taille maximale est atteinte.
+    ///
+    /// La bascule est évaluée **avant** l'écriture : le nouveau morceau est
+    /// donc immédiatement alimenté par la trame courante. C'est essentiel —
+    /// ouvrir le morceau suivant de façon anticipée laisserait, si
+    /// l'enregistrement s'arrête juste après, un dernier fichier vide (un
+    /// encodeur MP3 fraîchement initialisé ne produit rien tant qu'il n'a
+    /// reçu aucune trame).
     pub fn write_pcm(&mut self, samples: &[i16]) -> AudioResult<()> {
         if samples.is_empty() {
             return Ok(());
         }
-
-        self.sink.write_pcm(samples)?;
-        self.samples_written += samples.len() as u64;
 
         if let Some(limit) = self.max_bytes {
             if self.sink.bytes_written() + CHUNK_SAFETY_MARGIN_BYTES >= limit {
                 self.rotate()?;
             }
         }
+
+        self.sink.write_pcm(samples)?;
+        self.samples_written += samples.len() as u64;
         Ok(())
     }
 
@@ -350,7 +357,19 @@ impl ChunkedRecorder {
         let duration = self.duration();
         let last = self.sink.finalize()?;
         let mut paths = std::mem::take(&mut self.finished);
-        paths.push(last);
+
+        // Garde-fou : un dernier morceau resté vide (aucune trame reçue
+        // depuis la dernière bascule) est un artefact — on ne le conserve
+        // pas, pour ne jamais produire de fichier MP3 de 0 octet.
+        let last_is_empty = std::fs::metadata(&last)
+            .map(|meta| meta.len() == 0)
+            .unwrap_or(false);
+        if last_is_empty && !paths.is_empty() {
+            let _ = std::fs::remove_file(&last);
+        } else {
+            paths.push(last);
+        }
+
         Ok(RecordingSummary { paths, duration })
     }
 }
@@ -434,9 +453,9 @@ mod tests {
     #[test]
     fn chunking_produces_several_valid_independent_files() {
         let tmp = tempfile::tempdir().unwrap();
-        // Limite volontairement minuscule (64 Ko de marge ⇒ ~0 octet utile
-        // avant rotation), pour forcer plusieurs morceaux sur un signal court.
-        let limit = CHUNK_SAFETY_MARGIN_BYTES + 4_096;
+        // Limite volontairement minuscule (marge de 64 Ko + ~2 Ko utiles),
+        // pour forcer plusieurs morceaux sur un signal court.
+        let limit = CHUNK_SAFETY_MARGIN_BYTES + 2_000;
         let mut recorder =
             ChunkedRecorder::create(tmp.path(), "rec_chunk", RecordingFormat::Mp3, Some(limit))
                 .unwrap();
